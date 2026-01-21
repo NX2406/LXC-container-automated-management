@@ -1,1108 +1,1125 @@
 #!/bin/bash
 set -euo pipefail
 
-# ==============================================================================
-# LXD Panel v2 - Menu One-click Script (Panel-first + Node enroll)
-# ------------------------------------------------------------------------------
-# Menu:
-#   1) 安装 Panel 后端（中心端）
-#   2) 显示 Panel 对接 API（含登录信息）
-#   3) 生成节点配对 Token（pair_token）
-#   4) 安装 Node-Agent（宿主机）并对接到 Panel（enroll）
-#   5) 显示 Node 对接信息（Node-Agent 地址 + 当前节点ID）
-#   6) 卸载 Panel（可选保留数据）
-#   7) 卸载 Node-Agent（可选保留数据）
-#   0) 退出
+# ============================================================
+# LXD Panel v2 (Panel-first) + Node-Agent
+# - 宝塔式 UX：不自动退出；每步结束回菜单；自动打印入口/账号/API/token/下一步
+# - pair_token enroll：节点不再粘贴大 bundle
+# - Panel 代理 Node-Agent：/nodes/{id}/... 统一对接前端
+# - Node-Agent 执行 lxc：创建容器/限制/端口映射/带宽限速/重装/创建用户/端口池
 #
-# 说明：
-# - Panel 永远先可登录（不依赖节点）
-# - Node 通过 pair_token enroll 注册到 Panel，替代粘贴大 bundle
-# - Panel 代理转发调用节点：/nodes/{node_id}/...
+# 默认端口：
+#   Panel:     9876
+#   Node-Agent 19876
 #
-# 运行：
-#   chmod +x lxd-panel-menu-v2.sh && ./lxd-panel-menu-v2.sh
-#
-# 可选环境变量（默认值见下）：
-#   PANEL_API_PORT=9876
-#   PANEL_BIND_ADDR=0.0.0.0
-#   NODE_PORT=19876
-#   NODE_BIND_ADDR=0.0.0.0
-#   PORT_MIN=20000 PORT_MAX=40000 DEFAULT_PROFILE=default
-# ==============================================================================
+# 运行环境：Debian 11/12, Ubuntu 20.04/22.04/24.04
+# 需要：root
+# ============================================================
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;36m'; PLAIN='\033[0m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;36m'
+PLAIN='\033[0m'
+
+PANEL_PORT="${PANEL_PORT:-9876}"
+NODE_PORT="${NODE_PORT:-19876}"
+
+PANEL_DIR="/opt/lxd-panel-v2"
+NODE_DIR="/opt/lxd-node-agent"
+PANEL_ETC="/etc/lxd-panel-v2"
+NODE_ETC="/etc/lxd-node-agent"
+PANEL_DATA="/var/lib/lxd-panel-v2"
+NODE_DATA="/var/lib/lxd-node-agent"
+
+PANEL_SVC="lxd-panel-v2"
+NODE_SVC="lxd-node-agent"
+
+# ------------ utils ------------
 info(){ echo -e "${BLUE}[INFO]${PLAIN} $*"; }
 ok(){ echo -e "${GREEN}[OK]${PLAIN} $*"; }
 warn(){ echo -e "${YELLOW}[WARN]${PLAIN} $*"; }
-die(){ echo -e "${RED}[ERR]${PLAIN} $*"; exit 1; }
+err(){ echo -e "${RED}[ERR]${PLAIN} $*"; }
 
-[[ $EUID -eq 0 ]] || die "请用 root 运行"
+need_root(){
+  if [[ $EUID -ne 0 ]]; then
+    err "请使用 root 权限运行此脚本"
+    exit 1
+  fi
+}
 
-export DEBIAN_FRONTEND=noninteractive
+rand_hex(){ tr -dc 'a-f0-9' </dev/urandom | head -c "${1:-16}"; }
+rand_pw(){ tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c "${1:-18}"; }
 
-# ---------------- Defaults ----------------
-PANEL_API_PORT="${PANEL_API_PORT:-9876}"
-PANEL_BIND_ADDR="${PANEL_BIND_ADDR:-0.0.0.0}"
-
-NODE_PORT="${NODE_PORT:-19876}"
-NODE_BIND_ADDR="${NODE_BIND_ADDR:-0.0.0.0}"
-
-PORT_MIN="${PORT_MIN:-20000}"
-PORT_MAX="${PORT_MAX:-40000}"
-DEFAULT_PROFILE="${DEFAULT_PROFILE:-default}"
-
-BASE="/opt/lxd-panel-v2"
-PANEL_DIR="${BASE}/panel"
-NODE_DIR="${BASE}/node"
-
-CFG_DIR="/etc/lxd-panel-v2"
-DATA_DIR="/var/lib/lxd-panel-v2"
-LOG_DIR="/var/log/lxd-panel-v2"
-
-PANEL_SERVICE="lxd-panel"
-NODE_SERVICE="lxd-node-agent"
-
-# ---------------- Helpers ----------------
-need_cmd(){ command -v "$1" >/dev/null 2>&1; }
-
-rand_pw(){ tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c 20; }
-rand_hex(){ tr -dc 'a-f0-9' </dev/urandom | head -c "${1:-48}"; }
-
-host_ip() {
+detect_ip(){
   local ip
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
   [[ -z "${ip}" ]] && ip="127.0.0.1"
   echo "$ip"
 }
 
-detect_lxd_socket() {
-  local s1="/var/lib/lxd/unix.socket"
-  local s2="/var/snap/lxd/common/lxd/unix.socket"
-  [[ -S "$s1" ]] && { echo "$s1"; return; }
-  [[ -S "$s2" ]] && { echo "$s2"; return; }
-  echo "$s1"
+pause(){
+  echo
+  read -r -p "按回车键返回菜单..." _
 }
 
-install_pkgs_common() {
-  info "安装基础依赖..."
+apt_install(){
+  export DEBIAN_FRONTEND=noninteractive
+  info "安装依赖..."
   apt-get update -y
-  apt-get install -y curl ca-certificates jq sqlite3 iproute2 iptables \
-    python3 python3-venv python3-pip uidmap
-  ok "基础依赖安装完成"
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl jq sqlite3 \
+    python3 python3-venv python3-pip \
+    iproute2 iptables \
+    uidmap
+  ok "依赖安装完成"
 }
 
-install_lxd_if_needed() {
-  if ! need_cmd lxc; then
-    info "安装 LXD（apt）..."
-    apt-get install -y lxd
+ensure_lxd(){
+  if command -v lxc >/dev/null 2>&1; then
+    ok "已检测到 lxc：$(lxc --version 2>/dev/null || true)"
+    return
+  fi
+  warn "未检测到 lxc（LXD）。将尝试安装（Ubuntu/Debian 可能是 snap/apt 方案差异）。"
+  if command -v snap >/dev/null 2>&1; then
+    info "使用 snap 安装 lxd..."
+    snap install lxd --channel=5.0/stable || snap install lxd || true
+    ok "snap 安装尝试完成"
+  fi
+  if ! command -v lxc >/dev/null 2>&1; then
+    info "使用 apt 安装 lxd..."
+    apt-get install -y lxd lxd-client || true
+  fi
+  if ! command -v lxc >/dev/null 2>&1; then
+    warn "仍未检测到 lxc。你可以手动安装 LXD 后再安装 Node-Agent。"
   else
-    ok "LXD 已存在"
+    ok "LXD 已可用：$(lxc --version 2>/dev/null || true)"
   fi
 }
 
-init_lxd_if_needed() {
-  info "检查 LXD 是否初始化..."
-  if ! lxc info >/dev/null 2>&1; then
-    warn "LXD 未初始化，执行 lxd init --auto（安全默认）..."
-    lxd init --auto >/dev/null
+systemd_reload(){
+  systemctl daemon-reload
+}
+
+svc_start(){
+  local svc="$1"
+  systemctl enable "$svc" >/dev/null 2>&1 || true
+  systemctl restart "$svc"
+}
+
+svc_stop(){
+  local svc="$1"
+  systemctl stop "$svc" >/dev/null 2>&1 || true
+  systemctl disable "$svc" >/dev/null 2>&1 || true
+}
+
+svc_status_hint(){
+  local svc="$1"
+  systemctl --no-pager -l status "$svc" || true
+}
+
+curl_local(){
+  local url="$1"
+  curl -sS --max-time 3 "$url" || true
+}
+
+# ------------ write Panel backend ------------
+write_panel_app(){
+  mkdir -p "$PANEL_DIR" "$PANEL_ETC" "$PANEL_DATA"
+
+  # config
+  if [[ ! -f "$PANEL_ETC/panel.secret" ]]; then
+    rand_hex 64 > "$PANEL_ETC/panel.secret"
+    chmod 600 "$PANEL_ETC/panel.secret"
   fi
-  ok "LXD Ready（socket=$(detect_lxd_socket)）"
-}
+  if [[ ! -f "$PANEL_ETC/panel.admin.pass" ]]; then
+    rand_pw 18 > "$PANEL_ETC/panel.admin.pass"
+    chmod 600 "$PANEL_ETC/panel.admin.pass"
+  fi
+  if [[ ! -f "$PANEL_ETC/panel.conf" ]]; then
+    cat > "$PANEL_ETC/panel.conf" <<EOF
+PANEL_HOST=0.0.0.0
+PANEL_PORT=${PANEL_PORT}
+DB_PATH=${PANEL_DATA}/panel.db
+PANEL_SECRET_FILE=${PANEL_ETC}/panel.secret
+ADMIN_USER=admin
+ADMIN_PASS_FILE=${PANEL_ETC}/panel.admin.pass
+EOF
+    chmod 600 "$PANEL_ETC/panel.conf"
+  fi
 
-ensure_dirs() {
-  mkdir -p "$BASE" "$CFG_DIR" "$DATA_DIR" "$LOG_DIR"
-  chmod 750 "$DATA_DIR" "$LOG_DIR" || true
-}
-
-# ==============================================================================
-# PANEL (Central)
-# ==============================================================================
-write_panel_app() {
-  info "写入 Panel 后端代码..."
-  mkdir -p "${PANEL_DIR}/app"
-
-  cat > "${PANEL_DIR}/requirements.txt" << 'REQ'
-fastapi==0.115.6
-uvicorn[standard]==0.30.6
-pyjwt==2.9.0
-passlib[bcrypt]==1.7.4
-pydantic==2.10.3
-httpx==0.27.2
+  # python app
+  cat > "$PANEL_DIR/requirements.txt" <<'REQ'
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.4
+python-multipart==0.0.9
 REQ
 
-  cat > "${PANEL_DIR}/app/main.py" << 'PY'
-import os, json, sqlite3, secrets, time
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+  cat > "$PANEL_DIR/app.py" <<'PY'
+import os, time, hmac, hashlib, sqlite3, json, secrets
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from typing import Optional, Any, Dict
 
-import jwt
-import httpx
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
-from passlib.context import CryptContext
+APP = FastAPI(title="LXD Panel v2", version="2.0")
 
-APP_NAME="lxd-panel-v2"
-DB_PATH=os.getenv("PANEL_DB","/var/lib/lxd-panel-v2/panel.db")
-JWT_SECRET=os.getenv("PANEL_JWT_SECRET","change-me")
-JWT_ISSUER=os.getenv("PANEL_JWT_ISSUER","lxd-panel-v2")
-JWT_EXPIRE_MIN=int(os.getenv("PANEL_JWT_EXPIRE_MIN","1440"))
-ADMIN_USER=os.getenv("PANEL_ADMIN_USER","admin")
-ADMIN_PASS=os.getenv("PANEL_ADMIN_PASS","")
+def env(k, d=""):
+    return os.environ.get(k, d)
 
-pwd=CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer=HTTPBearer(auto_error=False)
-app=FastAPI(title="LXD Panel v2", version="2.0.0")
+DB_PATH = env("DB_PATH")
+PANEL_SECRET_FILE = env("PANEL_SECRET_FILE")
+ADMIN_USER = env("ADMIN_USER", "admin")
+ADMIN_PASS_FILE = env("ADMIN_PASS_FILE")
+
+def read_file(p):
+    with open(p, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+SECRET = read_file(PANEL_SECRET_FILE)
+ADMIN_PASS = read_file(ADMIN_PASS_FILE)
 
 def db():
-    c=sqlite3.connect(DB_PATH)
-    c.row_factory=sqlite3.Row
-    return c
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
 def init_db():
-    c=db(); cur=c.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS users(
-      username TEXT PRIMARY KEY,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS nodes(
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      url TEXT NOT NULL,
-      secret TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      last_seen TEXT
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS pair_tokens(
-      token TEXT PRIMARY KEY,
-      expires_at INTEGER NOT NULL,
-      used INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS audit(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts TEXT NOT NULL,
-      actor TEXT NOT NULL,
-      action TEXT NOT NULL,
-      detail TEXT NOT NULL
-    )""")
-    c.commit(); c.close()
+    con = db()
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY, name TEXT, url TEXT, node_key TEXT, created_at INTEGER)")
+    cur.execute("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, actor TEXT, action TEXT, detail TEXT)")
+    con.commit()
+    con.close()
 
-def audit(actor:str, action:str, detail:Dict[str,Any]):
-    c=db()
-    c.execute("INSERT INTO audit(ts,actor,action,detail) VALUES(?,?,?,?)",
-              (datetime.utcnow().isoformat()+"Z", actor, action, json.dumps(detail, ensure_ascii=False)))
-    c.commit(); c.close()
+def audit(actor, action, detail):
+    con = db()
+    con.execute("INSERT INTO audit(ts,actor,action,detail) VALUES(?,?,?,?)",
+                (int(time.time()), actor, action, json.dumps(detail, ensure_ascii=False)))
+    con.commit()
+    con.close()
 
-def ensure_admin():
-    if not ADMIN_PASS:
-        return
-    c=db()
-    r=c.execute("SELECT username FROM users WHERE username=?", (ADMIN_USER,)).fetchone()
-    if not r:
-        c.execute("INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-                  (ADMIN_USER, pwd.hash(ADMIN_PASS), "admin", datetime.utcnow().isoformat()+"Z"))
-        c.commit()
-    c.close()
+def sign(payload: bytes) -> str:
+    return hmac.new(SECRET.encode(), payload, hashlib.sha256).hexdigest()
 
-@app.on_event("startup")
-def _startup():
-    init_db()
-    ensure_admin()
+def make_jwt_like(username: str, ttl: int=3600) -> str:
+    # 简化：不是标准 JWT，但足够用于你这套内部面板
+    now = int(time.time())
+    body = {"u": username, "iat": now, "exp": now + ttl, "n": secrets.token_hex(8)}
+    raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+    return raw.hex() + "." + sign(raw)
 
-def mk_token(username:str, role:str)->str:
-    now=datetime.utcnow()
-    payload={"iss":JWT_ISSUER,"sub":username,"role":role,"iat":int(now.timestamp()),
-             "exp":int((now+timedelta(minutes=JWT_EXPIRE_MIN)).timestamp())}
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-def verify(creds: Optional[HTTPAuthorizationCredentials]) -> Dict[str,Any]:
-    if not creds:
-        raise HTTPException(401,"Missing Authorization")
+def verify_jwt_like(token: str) -> str:
     try:
-        return jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
+        raw_hex, sig = token.split(".", 1)
+        raw = bytes.fromhex(raw_hex)
+        if sign(raw) != sig:
+            raise ValueError("bad sig")
+        body = json.loads(raw.decode())
+        if int(time.time()) > int(body["exp"]):
+            raise ValueError("expired")
+        return str(body["u"])
     except Exception:
-        raise HTTPException(401,"Invalid token")
+        raise HTTPException(status_code=401, detail="unauthorized")
 
-def require_admin(payload=Depends(lambda c=Depends(bearer): verify(c))):
-    if payload.get("role")!="admin":
-        raise HTTPException(403,"Admin only")
-    return payload
+def require_auth(req: Request) -> str:
+    ah = req.headers.get("authorization", "")
+    if not ah.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    return verify_jwt_like(ah.split(" ", 1)[1].strip())
 
-class LoginReq(BaseModel):
-    username:str
-    password:str
+class LoginIn(BaseModel):
+    username: str
+    password: str
 
-@app.get("/health")
+class EnrollIn(BaseModel):
+    token: str
+    name: str
+    url: str
+
+init_db()
+
+@APP.get("/health")
 def health():
-    return {"ok":True,"name":APP_NAME,"ts":datetime.utcnow().isoformat()+"Z"}
+    return {"ok": True, "ts": int(time.time())}
 
-@app.post("/auth/login")
-def login(req:LoginReq):
-    c=db()
-    r=c.execute("SELECT username,password_hash,role FROM users WHERE username=?", (req.username,)).fetchone()
-    c.close()
-    if not r or not pwd.verify(req.password, r["password_hash"]):
-        raise HTTPException(401,"Bad credentials")
-    t=mk_token(r["username"], r["role"])
-    audit(r["username"],"login",{"username":r["username"]})
-    return {"token":t,"role":r["role"]}
+@APP.post("/auth/login")
+def login(i: LoginIn):
+    if i.username != ADMIN_USER or i.password != ADMIN_PASS:
+        raise HTTPException(status_code=401, detail="bad credentials")
+    t = make_jwt_like(i.username, ttl=12*3600)
+    audit(i.username, "auth.login", {"user": i.username})
+    return {"token": t}
 
-# -------- Pair Token --------
-class PairTokenResp(BaseModel):
-    token:str
-    expires_in:int
+@APP.post("/nodes/pair_token")
+def pair_token(ttl_seconds: int=600, req: Request=None):
+    actor = require_auth(req)
+    ttl = max(60, min(int(ttl_seconds), 3600))
+    now = int(time.time())
+    body = {"iat": now, "exp": now + ttl, "nonce": secrets.token_hex(8)}
+    raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+    token = raw.hex() + "." + sign(raw)
+    audit(actor, "pair_token.create", {"ttl": ttl})
+    return {"token": token, "expires_in": ttl}
 
-@app.post("/nodes/pair_token", response_model=PairTokenResp, dependencies=[Depends(require_admin)])
-def create_pair_token(ttl_seconds:int=600, payload=Depends(require_admin)):
-    ttl_seconds=max(60, min(ttl_seconds, 3600))
-    token=secrets.token_urlsafe(24)
-    exp=int(time.time())+ttl_seconds
-    c=db()
-    c.execute("INSERT INTO pair_tokens(token,expires_at,used,created_at) VALUES(?,?,0,?)",
-              (token, exp, datetime.utcnow().isoformat()+"Z"))
-    c.commit(); c.close()
-    audit(payload["sub"],"pair_token.create",{"ttl":ttl_seconds})
-    return PairTokenResp(token=token, expires_in=ttl_seconds)
-
-# -------- Enroll --------
-class EnrollReq(BaseModel):
-    token:str
-    name:str = Field(..., min_length=1, max_length=64)
-    url:str  = Field(..., min_length=5, max_length=256)
-
-class EnrollResp(BaseModel):
-    node_id:str
-    node_secret:str
-
-@app.post("/nodes/enroll", response_model=EnrollResp)
-def enroll(req:EnrollReq, request:Request):
-    now=int(time.time())
-    c=db()
-    t=c.execute("SELECT token,expires_at,used FROM pair_tokens WHERE token=?", (req.token,)).fetchone()
-    if not t:
-        c.close(); raise HTTPException(403,"Invalid pair token")
-    if int(t["used"])==1:
-        c.close(); raise HTTPException(403,"Pair token already used")
-    if now>int(t["expires_at"]):
-        c.close(); raise HTTPException(403,"Pair token expired")
-
-    node_id=secrets.token_hex(8)
-    node_secret=secrets.token_urlsafe(32)
-
-    c.execute("UPDATE pair_tokens SET used=1 WHERE token=?", (req.token,))
-    c.execute("INSERT INTO nodes(id,name,url,secret,created_at,last_seen) VALUES(?,?,?,?,?,?)",
-              (node_id, req.name, req.url.rstrip("/"), node_secret, datetime.utcnow().isoformat()+"Z", None))
-    c.commit(); c.close()
-
-    audit("node-enroll","node.enroll",{"node_id":node_id,"name":req.name,"url":req.url,"from":request.client.host if request.client else None})
-    return EnrollResp(node_id=node_id, node_secret=node_secret)
-
-# -------- Nodes --------
-@app.get("/nodes", dependencies=[Depends(require_admin)])
-def list_nodes(payload=Depends(require_admin)):
-    c=db()
-    rows=c.execute("SELECT id,name,url,created_at,last_seen FROM nodes ORDER BY created_at DESC").fetchall()
-    c.close()
-    return {"nodes":[dict(r) for r in rows]}
-
-@app.get("/nodes/{node_id}/health", dependencies=[Depends(require_admin)])
-async def node_health(node_id:str, payload=Depends(require_admin)):
-    c=db()
-    n=c.execute("SELECT url,secret FROM nodes WHERE id=?", (node_id,)).fetchone()
-    c.close()
-    if not n: raise HTTPException(404,"Node not found")
-    async with httpx.AsyncClient(timeout=6) as client:
-        r=await client.get(f"{n['url']}/node/health", headers={"X-Node-Secret":n["secret"]})
-    if r.status_code!=200:
-        raise HTTPException(502,f"Node unhealthy: {r.text}")
-    c=db()
-    c.execute("UPDATE nodes SET last_seen=? WHERE id=?", (datetime.utcnow().isoformat()+"Z", node_id))
-    c.commit(); c.close()
-    return r.json()
-
-# -------- Proxy to node --------
-@app.api_route("/nodes/{node_id}/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE"], dependencies=[Depends(require_admin)])
-async def proxy(node_id:str, path:str, request:Request, payload=Depends(require_admin)):
-    c=db()
-    n=c.execute("SELECT url,secret FROM nodes WHERE id=?", (node_id,)).fetchone()
-    c.close()
-    if not n:
-        raise HTTPException(404,"Node not found")
-
-    target=f"{n['url'].rstrip('/')}/{path.lstrip('/')}"
-    method=request.method.upper()
-    params=dict(request.query_params)
-    body=await request.body()
-
-    headers={}
-    if request.headers.get("content-type"):
-        headers["content-type"]=request.headers["content-type"]
-    headers["X-Node-Secret"]=n["secret"]
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r=await client.request(method, target, params=params, content=body, headers=headers)
-
-    audit(payload["sub"],"node.proxy",{"node_id":node_id,"method":method,"path":path,"status":r.status_code})
+def verify_pair_token(token: str) -> None:
     try:
-        return r.json()
+        raw_hex, sig = token.split(".", 1)
+        raw = bytes.fromhex(raw_hex)
+        if sign(raw) != sig:
+            raise ValueError("bad sig")
+        body = json.loads(raw.decode())
+        if int(time.time()) > int(body["exp"]):
+            raise ValueError("expired")
     except Exception:
-        return {"status":r.status_code,"text":r.text}
+        raise HTTPException(status_code=400, detail="bad or expired pair_token")
 
-@app.get("/audit", dependencies=[Depends(require_admin)])
-def get_audit(limit:int=200, payload=Depends(require_admin)):
-    c=db()
-    rows=c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
-    c.close()
-    return {"audit":[dict(r) for r in rows]}
+@APP.post("/nodes/enroll")
+def enroll(i: EnrollIn):
+    # 无需 JWT：只凭 pair_token
+    verify_pair_token(i.token)
+    node_id = secrets.token_hex(8)
+    node_key = secrets.token_hex(16)
+    con = db()
+    con.execute("INSERT INTO nodes(id,name,url,node_key,created_at) VALUES(?,?,?,?,?)",
+                (node_id, i.name.strip()[:64], i.url.strip().rstrip("/"), node_key, int(time.time())))
+    con.commit()
+    con.close()
+    audit("enroll", "node.enroll", {"node_id": node_id, "name": i.name, "url": i.url})
+    return {"node_id": node_id, "node_key": node_key}
+
+@APP.get("/nodes")
+def nodes(req: Request):
+    actor = require_auth(req)
+    con = db()
+    rows = con.execute("SELECT id,name,url,created_at FROM nodes ORDER BY created_at DESC").fetchall()
+    con.close()
+    return {"nodes": [dict(r) for r in rows]}
+
+@APP.get("/nodes/{node_id}/health")
+def node_health(node_id: str, req: Request):
+    actor = require_auth(req)
+    con = db()
+    row = con.execute("SELECT url,node_key FROM nodes WHERE id=?", (node_id,)).fetchone()
+    con.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="node not found")
+    import requests
+    try:
+        r = requests.get(row["url"] + "/health", headers={"X-Node-Key": row["node_key"]}, timeout=3)
+        r.raise_for_status()
+        audit(actor, "node.health", {"node_id": node_id})
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"node unreachable: {e}")
+
+# ---------------- proxy to node-agent ----------------
+def proxy(actor: str, node_id: str, method: str, path: str, body: Optional[Dict[str, Any]] = None):
+    con = db()
+    row = con.execute("SELECT url,node_key FROM nodes WHERE id=?", (node_id,)).fetchone()
+    con.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="node not found")
+
+    import requests
+    url = row["url"] + path
+    headers = {"X-Node-Key": row["node_key"]}
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=15)
+        elif method == "POST":
+            r = requests.post(url, headers=headers, json=body, timeout=60)
+        elif method == "DELETE":
+            r = requests.delete(url, headers=headers, timeout=60)
+        else:
+            raise HTTPException(status_code=400, detail="unsupported method")
+        if r.status_code >= 400:
+            # pass through
+            try:
+                detail = r.json()
+            except Exception:
+                detail = {"detail": r.text}
+            raise HTTPException(status_code=r.status_code, detail=detail.get("detail", detail))
+        audit(actor, "node.proxy", {"node_id": node_id, "method": method, "path": path})
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": True, "raw": r.text}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"proxy error: {e}")
+
+@APP.get("/nodes/{node_id}/instances")
+def node_instances(node_id: str, req: Request):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "GET", "/instances")
+
+@APP.post("/nodes/{node_id}/instances")
+def node_instance_create(node_id: str, req: Request, body: Dict[str, Any]):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "POST", "/instances", body)
+
+@APP.post("/nodes/{node_id}/instances/{name}/limits")
+def node_limits(node_id: str, name: str, req: Request, body: Dict[str, Any]):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "POST", f"/instances/{name}/limits", body)
+
+@APP.get("/nodes/{node_id}/ports")
+def node_ports(node_id: str, req: Request):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "GET", "/ports")
+
+@APP.post("/nodes/{node_id}/instances/{name}/ports")
+def node_add_port(node_id: str, name: str, req: Request, body: Dict[str, Any]):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "POST", f"/instances/{name}/ports", body)
+
+@APP.delete("/nodes/{node_id}/instances/{name}/ports/{host_port}")
+def node_del_port(node_id: str, name: str, host_port: int, req: Request):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "DELETE", f"/instances/{name}/ports/{host_port}")
+
+@APP.post("/nodes/{node_id}/instances/{name}/reinstall")
+def node_reinstall(node_id: str, name: str, req: Request, body: Dict[str, Any]):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "POST", f"/instances/{name}/reinstall", body)
+
+@APP.post("/nodes/{node_id}/instances/{name}/users")
+def node_users(node_id: str, name: str, req: Request, body: Dict[str, Any]):
+    actor = require_auth(req)
+    return proxy(actor, node_id, "POST", f"/instances/{name}/users", body)
+
+@APP.get("/audit")
+def audit_list(limit: int=200, req: Request=None):
+    actor = require_auth(req)
+    n = max(1, min(int(limit), 1000))
+    con = db()
+    rows = con.execute("SELECT ts,actor,action,detail FROM audit ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+    con.close()
+    return {"items": [dict(r) for r in rows]}
 PY
-  ok "Panel 代码写入完成"
-}
 
-panel_setup_venv() {
+  # venv
+  if [[ ! -d "$PANEL_DIR/venv" ]]; then
+    info "创建 Panel venv..."
+    python3 -m venv "$PANEL_DIR/venv"
+  fi
   info "安装 Panel Python 依赖..."
-  python3 -m venv "${PANEL_DIR}/venv"
-  "${PANEL_DIR}/venv/bin/pip" install --upgrade pip >/dev/null
-  "${PANEL_DIR}/venv/bin/pip" install -r "${PANEL_DIR}/requirements.txt" >/dev/null
+  "$PANEL_DIR/venv/bin/pip" -q install --upgrade pip >/dev/null
+  "$PANEL_DIR/venv/bin/pip" -q install -r "$PANEL_DIR/requirements.txt" >/dev/null
   ok "Panel 依赖安装完成"
-}
 
-panel_write_env() {
-  info "写入 Panel 配置..."
-  mkdir -p "$CFG_DIR" "$DATA_DIR" "$LOG_DIR"
-  chmod 750 "$DATA_DIR" "$LOG_DIR" || true
-
-  local admin_pass jwt_secret
-  admin_pass="$(rand_pw)"
-  jwt_secret="$(rand_hex 48)"
-
-  cat > "${CFG_DIR}/panel.env" << EOF
-PANEL_DB=${DATA_DIR}/panel.db
-PANEL_ADMIN_USER=admin
-PANEL_ADMIN_PASS=${admin_pass}
-PANEL_JWT_SECRET=${jwt_secret}
-PANEL_JWT_ISSUER=lxd-panel-v2
-PANEL_JWT_EXPIRE_MIN=1440
-EOF
-  chmod 600 "${CFG_DIR}/panel.env"
-  echo "$admin_pass" > "${CFG_DIR}/panel.admin.pass"
-  chmod 600 "${CFG_DIR}/panel.admin.pass"
-  ok "Panel 配置已生成：${CFG_DIR}/panel.env"
-}
-
-panel_bootstrap_db() {
-  info "初始化 Panel DB..."
-  set +u
-  # shellcheck disable=SC1090
-  source "${CFG_DIR}/panel.env"
-  set -u
-
-  python3 - << 'PY'
-import os, sqlite3
-from datetime import datetime
-from passlib.context import CryptContext
-
-DB=os.getenv("PANEL_DB")
-ADMIN_USER=os.getenv("PANEL_ADMIN_USER","admin")
-ADMIN_PASS=os.getenv("PANEL_ADMIN_PASS","")
-pwd=CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-os.makedirs(os.path.dirname(DB), exist_ok=True)
-c=sqlite3.connect(DB)
-cur=c.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS users(
-  username TEXT PRIMARY KEY,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL,
-  created_at TEXT NOT NULL
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS nodes(
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  url TEXT NOT NULL,
-  secret TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  last_seen TEXT
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS pair_tokens(
-  token TEXT PRIMARY KEY,
-  expires_at INTEGER NOT NULL,
-  used INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS audit(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  action TEXT NOT NULL,
-  detail TEXT NOT NULL
-)""")
-c.commit()
-
-if ADMIN_PASS:
-    r=cur.execute("SELECT username FROM users WHERE username=?", (ADMIN_USER,)).fetchone()
-    if not r:
-        cur.execute("INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-                    (ADMIN_USER, pwd.hash(ADMIN_PASS), "admin", datetime.utcnow().isoformat()+"Z"))
-        c.commit()
-c.close()
-PY
-  ok "Panel DB 初始化完成：${DATA_DIR}/panel.db"
-}
-
-panel_systemd() {
-  info "注册 Panel systemd..."
-  cat > "/etc/systemd/system/${PANEL_SERVICE}.service" << EOF
+  # systemd
+  cat > "/etc/systemd/system/${PANEL_SVC}.service" <<EOF
 [Unit]
-Description=LXD Panel v2 (central)
+Description=LXD Panel v2 (FastAPI)
 After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=${CFG_DIR}/panel.env
-WorkingDirectory=${PANEL_DIR}
-ExecStart=${PANEL_DIR}/venv/bin/uvicorn app.main:app --host ${PANEL_BIND_ADDR} --port ${PANEL_API_PORT} --proxy-headers
+EnvironmentFile=${PANEL_ETC}/panel.conf
+ExecStart=${PANEL_DIR}/venv/bin/uvicorn app:APP --app-dir ${PANEL_DIR} --host \${PANEL_HOST} --port \${PANEL_PORT}
 Restart=always
 RestartSec=2
 User=root
+WorkingDirectory=${PANEL_DIR}
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=${DATA_DIR} ${LOG_DIR} ${CFG_DIR} ${PANEL_DIR}
+ReadWritePaths=${PANEL_DIR} ${PANEL_ETC} ${PANEL_DATA}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable "${PANEL_SERVICE}" >/dev/null
-  systemctl restart "${PANEL_SERVICE}"
-  ok "Panel 服务已启动：${PANEL_SERVICE}"
+  systemd_reload
+  svc_start "$PANEL_SVC"
+  ok "Panel 服务已启动：${PANEL_SVC}"
 }
 
-panel_show_api() {
-  local ip; ip="$(host_ip)"
-  echo -e "\n${GREEN}================= Panel 对接信息 =================${PLAIN}"
-  echo -e "API Base : ${BLUE}http://${ip}:${PANEL_API_PORT}${PLAIN}"
-  echo -e "Health   : ${BLUE}GET  /health${PLAIN}"
-  echo -e "Login    : ${BLUE}POST /auth/login${PLAIN}"
-  echo -e "Nodes    : ${BLUE}GET  /nodes (需 JWT)${PLAIN}"
-  echo -e "Proxy调用: ${BLUE}/nodes/{node_id}/...${PLAIN}"
-  echo -e "Admin 密码文件: ${YELLOW}${CFG_DIR}/panel.admin.pass${PLAIN}"
+# ------------ write Node-Agent ------------
+write_node_app(){
+  mkdir -p "$NODE_DIR" "$NODE_ETC" "$NODE_DATA"
 
-  if [[ -f "${CFG_DIR}/panel.admin.pass" ]]; then
-    local admin_pass; admin_pass="$(cat "${CFG_DIR}/panel.admin.pass")"
-    echo -e "Admin: ${YELLOW}admin / ${admin_pass}${PLAIN}"
-    echo -e "\n示例（获取 TOKEN）："
-    cat << EOF
-TOKEN=\$(curl -s http://${ip}:${PANEL_API_PORT}/auth/login \\
-  -H 'Content-Type: application/json' \\
-  -d '{"username":"admin","password":"${admin_pass}"}' | jq -r .token)
-echo "\$TOKEN"
+  # config
+  if [[ ! -f "$NODE_ETC/node.key" ]]; then
+    rand_hex 32 > "$NODE_ETC/node.key"
+    chmod 600 "$NODE_ETC/node.key"
+  fi
+  if [[ ! -f "$NODE_ETC/node.conf" ]]; then
+    cat > "$NODE_ETC/node.conf" <<EOF
+NODE_HOST=0.0.0.0
+NODE_PORT=${NODE_PORT}
+NODE_KEY_FILE=${NODE_ETC}/node.key
+PORT_RANGE_START=20000
+PORT_RANGE_END=39999
+DB_PATH=${NODE_DATA}/node.db
 EOF
-  else
-    warn "未发现 admin 密码文件（可能未安装或被删除）"
+    chmod 600 "$NODE_ETC/node.conf"
   fi
 
-  echo -e "\n监听检查："
-  echo "  ss -lntp | grep -E '(:${PANEL_API_PORT}|uvicorn)' || true"
-  echo -e "${GREEN}=================================================${PLAIN}\n"
-
-  if curl -s "http://127.0.0.1:${PANEL_API_PORT}/health" >/dev/null 2>&1; then
-    ok "本机可访问：curl http://127.0.0.1:${PANEL_API_PORT}/health"
-  else
-    warn "本机暂不可访问（看：systemctl status ${PANEL_SERVICE} --no-pager）"
-  fi
-}
-
-panel_install() {
-  install_pkgs_common
-  ensure_dirs
-  mkdir -p "${PANEL_DIR}"
-
-  write_panel_app
-  panel_setup_venv
-  panel_write_env
-  panel_bootstrap_db
-  panel_systemd
-
-  systemctl is-active --quiet "${PANEL_SERVICE}" && ok "Panel 安装成功" || warn "Panel 服务未正常运行"
-  panel_show_api
-}
-
-panel_uninstall() {
-  warn "卸载 Panel..."
-  read -r -p "是否保留数据（DB/日志）？[y/N]: " keep
-  keep="${keep:-N}"
-
-  systemctl stop "${PANEL_SERVICE}" >/dev/null 2>&1 || true
-  systemctl disable "${PANEL_SERVICE}" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${PANEL_SERVICE}.service"
-  systemctl daemon-reload
-
-  rm -rf "${PANEL_DIR}" || true
-  rm -f "${CFG_DIR}/panel.env" "${CFG_DIR}/panel.admin.pass" || true
-
-  if [[ "${keep}" =~ ^[Yy]$ ]]; then
-    ok "已卸载 Panel（保留数据：${DATA_DIR} / ${LOG_DIR}）"
-  else
-    rm -rf "${DATA_DIR}" "${LOG_DIR}" || true
-    ok "已卸载 Panel（数据也已清理）"
-  fi
-}
-
-# ==============================================================================
-# NODE (Host Agent)
-# ==============================================================================
-write_node_app() {
-  info "写入 Node-Agent 代码..."
-  mkdir -p "${NODE_DIR}/app"
-
-  cat > "${NODE_DIR}/requirements.txt" << 'REQ'
-fastapi==0.115.6
-uvicorn[standard]==0.30.6
-pydantic==2.10.3
+  cat > "$NODE_DIR/requirements.txt" <<'REQ'
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.4
 REQ
 
-  cat > "${NODE_DIR}/app/main.py" << 'PY'
-import os, json, sqlite3, subprocess
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+  cat > "$NODE_DIR/agent.py" <<'PY'
+import os, time, sqlite3, subprocess, json
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends, Request
-from pydantic import BaseModel, Field
+APP = FastAPI(title="LXD Node-Agent", version="2.0")
 
-APP_NAME="lxd-node-agent-v2"
-DB_PATH=os.getenv("NODE_DB","/var/lib/lxd-panel-v2/node.db")
-NODE_ID=os.getenv("NODE_ID","")
-NODE_SECRET=os.getenv("NODE_SECRET","")
-PORT_MIN=int(os.getenv("NODE_PORT_MIN","20000"))
-PORT_MAX=int(os.getenv("NODE_PORT_MAX","40000"))
-DEFAULT_PROFILE=os.getenv("NODE_DEFAULT_PROFILE","default")
+def env(k, d=""):
+    return os.environ.get(k, d)
 
-app=FastAPI(title="LXD Node-Agent v2", version="2.0.0")
+DB_PATH = env("DB_PATH")
+NODE_KEY_FILE = env("NODE_KEY_FILE")
+PORT_RANGE_START = int(env("PORT_RANGE_START", "20000"))
+PORT_RANGE_END   = int(env("PORT_RANGE_END", "39999"))
+
+def read_file(p):
+    with open(p, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+NODE_KEY = read_file(NODE_KEY_FILE)
+
+def require_node_key(req: Request):
+    k = req.headers.get("X-Node-Key", "")
+    if k != NODE_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized node key")
 
 def db():
-    c=sqlite3.connect(DB_PATH)
-    c.row_factory=sqlite3.Row
-    return c
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
 def init_db():
-    c=db()
-    c.execute("""CREATE TABLE IF NOT EXISTS ports(
-      host_port INTEGER PRIMARY KEY,
-      in_use INTEGER NOT NULL DEFAULT 0,
-      container TEXT,
-      container_port INTEGER,
-      proto TEXT,
-      created_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS audit(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts TEXT NOT NULL,
-      action TEXT NOT NULL,
-      detail TEXT NOT NULL
-    )""")
-    c.commit(); c.close()
+    con = db()
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS ports(host_port INTEGER PRIMARY KEY, proto TEXT, container_name TEXT, container_port INTEGER, created_at INTEGER)")
+    con.commit()
+    con.close()
 
-@app.on_event("startup")
-def _startup():
-    init_db()
-
-def audit(action:str, detail:Dict[str,Any]):
-    c=db()
-    c.execute("INSERT INTO audit(ts,action,detail) VALUES(?,?,?)",
-              (datetime.utcnow().isoformat()+"Z", action, json.dumps(detail, ensure_ascii=False)))
-    c.commit(); c.close()
-
-def require_panel(request:Request):
-    got=request.headers.get("X-Node-Secret","")
-    if not NODE_SECRET or got!=NODE_SECRET:
-        raise HTTPException(401,"Bad node secret")
-    return True
-
-def run_lxc(args:List[str], timeout:int=120)->str:
-    cmd=["lxc"]+args
-    p=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-    if p.returncode!=0:
-        raise HTTPException(400, f"lxc error: {p.stderr.strip()}")
-    return p.stdout.strip()
-
-def lxc_json(args:List[str])->Any:
-    out=run_lxc(args+["--format=json"])
+def sh(cmd: list, timeout=120) -> str:
     try:
-        return json.loads(out) if out else None
-    except Exception:
-        raise HTTPException(500,"Failed to parse JSON")
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        if p.returncode != 0:
+            raise HTTPException(status_code=400, detail=p.stderr.strip() or f"cmd failed: {cmd}")
+        return p.stdout
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="command timeout")
 
-def ensure_port_rows():
-    c=db()
-    n=c.execute("SELECT COUNT(*) AS c FROM ports").fetchone()["c"]
-    if n==0:
-        now=datetime.utcnow().isoformat()+"Z"
-        c.executemany("INSERT INTO ports(host_port,in_use,created_at) VALUES(?,?,?)",
-                      [(p,0,now) for p in range(PORT_MIN, PORT_MAX+1)])
-        c.commit()
-    c.close()
+def lxc(args: list, timeout=180) -> str:
+    return sh(["lxc"] + args, timeout=timeout)
 
-def allocate_port(container:str, cport:int, proto:str)->int:
-    ensure_port_rows()
-    c=db()
-    row=c.execute("SELECT host_port FROM ports WHERE in_use=0 LIMIT 1").fetchone()
-    if not row:
-        c.close()
-        raise HTTPException(409,"Port pool exhausted")
-    hp=int(row["host_port"])
-    c.execute("UPDATE ports SET in_use=1, container=?, container_port=?, proto=?, created_at=? WHERE host_port=?",
-              (container, int(cport), proto, datetime.utcnow().isoformat()+"Z", hp))
-    c.commit(); c.close()
-    return hp
+def ensure_instance(name: str):
+    out = lxc(["list", name, "--format", "json"])
+    arr = json.loads(out or "[]")
+    if not arr:
+        raise HTTPException(status_code=404, detail="instance not found")
 
-def release_port(host_port:int):
-    c=db()
-    c.execute("UPDATE ports SET in_use=0, container=NULL, container_port=NULL, proto=NULL WHERE host_port=?",
-              (int(host_port),))
-    c.commit(); c.close()
+def allocate_port() -> int:
+    con = db()
+    used = {r["host_port"] for r in con.execute("SELECT host_port FROM ports").fetchall()}
+    con.close()
+    for p in range(PORT_RANGE_START, PORT_RANGE_END + 1):
+        if p not in used:
+            return p
+    raise HTTPException(status_code=409, detail="port pool exhausted")
 
-def get_inst_ipv4(name:str)->str:
-    st=lxc_json(["query", f"/1.0/instances/{name}/state"])
-    ip=None
-    if st and "network" in st:
-        for _, meta in st["network"].items():
-            for a in meta.get("addresses", []):
-                if a.get("family")=="inet" and a.get("scope")=="global":
-                    ip=a.get("address"); break
-            if ip: break
-    if not ip:
-        raise HTTPException(409,"Instance has no IPv4 yet (start it and wait DHCP)")
-    return ip
+def save_port(host_port: int, proto: str, cname: str, cport: int):
+    con = db()
+    con.execute("INSERT INTO ports(host_port,proto,container_name,container_port,created_at) VALUES(?,?,?,?,?)",
+                (host_port, proto, cname, cport, int(time.time())))
+    con.commit()
+    con.close()
 
-def get_host_veth(name:str)->Optional[str]:
-    st=lxc_json(["query", f"/1.0/instances/{name}/state"])
-    if not st: return None
-    for _, meta in st.get("network", {}).items():
-        hn=meta.get("host_name")
-        if hn: return hn
+def del_port(host_port: int):
+    con = db()
+    r = con.execute("SELECT * FROM ports WHERE host_port=?", (host_port,)).fetchone()
+    if not r:
+        con.close()
+        raise HTTPException(status_code=404, detail="mapping not found")
+    con.execute("DELETE FROM ports WHERE host_port=?", (host_port,))
+    con.commit()
+    con.close()
+    return dict(r)
+
+init_db()
+
+@APP.get("/health")
+def health(req: Request):
+    require_node_key(req)
+    return {"ok": True, "ts": int(time.time())}
+
+@APP.get("/ports")
+def ports(req: Request):
+    require_node_key(req)
+    con = db()
+    rows = con.execute("SELECT host_port,proto,container_name,container_port,created_at FROM ports ORDER BY host_port ASC").fetchall()
+    con.close()
+    return {"ports": [dict(r) for r in rows], "range": [PORT_RANGE_START, PORT_RANGE_END]}
+
+@APP.get("/instances")
+def instances(req: Request):
+    require_node_key(req)
+    out = lxc(["list", "--format", "json"])
+    return {"instances": json.loads(out or "[]")}
+
+class CreateIn(BaseModel):
+    name: str
+    image: str = "images:ubuntu/22.04"
+    cpu_cores: Optional[int] = None
+    cpu_limit_percent: Optional[int] = None
+    memory_mb: Optional[int] = None
+    disk_gb: Optional[int] = None
+    up_mbit: Optional[int] = None
+    down_mbit: Optional[int] = None
+
+@APP.post("/instances")
+def create(i: CreateIn, req: Request):
+    require_node_key(req)
+
+    # create container
+    lxc(["init", i.image, i.name])
+
+    # disk: best-effort root size
+    if i.disk_gb:
+        try:
+            lxc(["config", "device", "set", i.name, "root", "size", f"{i.disk_gb}GB"])
+        except HTTPException:
+            # fallback: set config if device missing
+            pass
+
+    # cpu/mem
+    if i.cpu_cores:
+        lxc(["config", "set", i.name, "limits.cpu", str(i.cpu_cores)])
+    if i.memory_mb:
+        lxc(["config", "set", i.name, "limits.memory", f"{i.memory_mb}MB"])
+
+    # cpu allowance (percent)
+    if i.cpu_limit_percent:
+        # 50% = "50%"
+        lxc(["config", "set", i.name, "limits.cpu.allowance", f"{i.cpu_limit_percent}%"])
+
+    # start
+    lxc(["start", i.name])
+
+    # bandwidth shaping (best-effort): use tc on veth later via limits endpoint
+    if i.up_mbit or i.down_mbit:
+        apply_tc(i.name, i.up_mbit, i.down_mbit)
+
+    return {"ok": True, "name": i.name}
+
+def get_veth(container: str) -> Optional[str]:
+    # try: lxc config show -> volatile.eth0.host_name
+    out = lxc(["config", "show", container])
+    for line in out.splitlines():
+        if "volatile.eth0.host_name:" in line:
+            return line.split(":",1)[1].strip()
     return None
 
-def tc_limit(dev:str, up_mbit:Optional[int], down_mbit:Optional[int]):
-    if not dev:
-        raise HTTPException(400,"No host veth found")
-    def sh(cmd:List[str]):
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    sh(["tc","qdisc","del","dev",dev,"root"])
-    if up_mbit and up_mbit>0:
-        sh(["tc","qdisc","add","dev",dev,"root","handle","1:","htb","default","10"])
-        sh(["tc","class","add","dev",dev,"parent","1:","classid","1:10","htb","rate",f"{up_mbit}mbit","ceil",f"{up_mbit}mbit"])
-    ifb=f"ifb-{dev}"[:15]
-    sh(["modprobe","ifb"])
-    sh(["ip","link","add",ifb,"type","ifb"])
-    sh(["ip","link","set","dev",ifb,"up"])
-    sh(["tc","qdisc","del","dev",dev,"ingress"])
-    sh(["tc","qdisc","del","dev",ifb,"root"])
-    if down_mbit and down_mbit>0:
-        sh(["tc","qdisc","add","dev",dev,"handle","ffff:","ingress"])
-        sh(["tc","filter","add","dev",dev,"parent","ffff:","protocol","ip","u32","match","u32","0","0","action","mirred","egress","redirect","dev",ifb])
-        sh(["tc","qdisc","add","dev",ifb,"root","handle","2:","htb","default","20"])
-        sh(["tc","class","add","dev",ifb,"parent","2:","classid","2:20","htb","rate",f"{down_mbit}mbit","ceil",f"{down_mbit}mbit"])
+def apply_tc(container: str, up_mbit: Optional[int], down_mbit: Optional[int]):
+    veth = get_veth(container)
+    if not veth:
+        raise HTTPException(status_code=400, detail="cannot find veth host_name for eth0")
+    # NOTE: tc shaping is tricky; here is a conservative HTB setup (best-effort).
+    # up: egress on veth
+    if up_mbit:
+        sh(["tc","qdisc","replace","dev",veth,"root","handle","1:","htb","default","10"])
+        sh(["tc","class","replace","dev",veth,"parent","1:","classid","1:10","htb","rate",f"{up_mbit}mbit","ceil",f"{up_mbit}mbit"])
+    # down: ingress policing via ifb is complex; we do a minimal ingress police (best-effort).
+    if down_mbit:
+        sh(["tc","qdisc","replace","dev",veth,"ingress"])
+        sh(["tc","filter","replace","dev",veth,"parent","ffff:","protocol","ip","prio","50","u32","match","u32","0","0",
+            "police","rate",f"{down_mbit}mbit","burst","10k","drop","flowid",":1"])
 
-class CreateInstanceReq(BaseModel):
-    name: str = Field(..., pattern=r"^[a-zA-Z0-9][a-zA-Z0-9\-]{1,61}$")
-    image: str = "images:ubuntu/22.04"
-    profiles: List[str] = Field(default_factory=lambda:[DEFAULT_PROFILE])
-    cpu_cores: Optional[int] = Field(None, ge=1, le=256)
-    cpu_limit_percent: Optional[int] = Field(None, ge=1, le=100)
-    memory_mb: Optional[int] = Field(None, ge=128)
-    disk_gb: Optional[int] = Field(None, ge=1)
-    up_mbit: Optional[int] = Field(None, ge=1)
-    down_mbit: Optional[int] = Field(None, ge=1)
+class LimitsIn(BaseModel):
+    cpu_cores: Optional[int] = None
+    cpu_limit_percent: Optional[int] = None
+    memory_mb: Optional[int] = None
+    disk_gb: Optional[int] = None
+    up_mbit: Optional[int] = None
+    down_mbit: Optional[int] = None
 
-class LimitReq(BaseModel):
-    cpu_cores: Optional[int] = Field(None, ge=1, le=256)
-    cpu_limit_percent: Optional[int] = Field(None, ge=1, le=100)
-    memory_mb: Optional[int] = Field(None, ge=128)
-    disk_gb: Optional[int] = Field(None, ge=1)
-    up_mbit: Optional[int] = Field(None, ge=1)
-    down_mbit: Optional[int] = Field(None, ge=1)
+@APP.post("/instances/{name}/limits")
+def limits(name: str, i: LimitsIn, req: Request):
+    require_node_key(req)
+    ensure_instance(name)
 
-class PortMapReq(BaseModel):
-    container_port:int = Field(..., ge=1, le=65535)
-    proto:str = Field("tcp", pattern=r"^(tcp|udp)$")
-    host_port: Optional[int] = Field(None, ge=1, le=65535)
+    if i.cpu_cores:
+        lxc(["config","set",name,"limits.cpu",str(i.cpu_cores)])
+    if i.memory_mb:
+        lxc(["config","set",name,"limits.memory",f"{i.memory_mb}MB"])
+    if i.cpu_limit_percent:
+        lxc(["config","set",name,"limits.cpu.allowance",f"{i.cpu_limit_percent}%"])
+    if i.disk_gb:
+        try:
+            lxc(["config","device","set",name,"root","size",f"{i.disk_gb}GB"])
+        except HTTPException:
+            pass
+    if i.up_mbit or i.down_mbit:
+        apply_tc(name, i.up_mbit, i.down_mbit)
 
-class ReinstallReq(BaseModel):
-    image:str
-    preserve_ports: bool=True
-    preserve_limits: bool=True
+    return {"ok": True}
 
-class LinuxUserReq(BaseModel):
-    username: str = Field(..., pattern=r"^[a-z_][a-z0-9_-]{0,30}$")
+class AddPortIn(BaseModel):
+    container_port: int
+    proto: str = "tcp"
+    host_port: Optional[int] = None
+
+@APP.post("/instances/{name}/ports")
+def add_port(name: str, i: AddPortIn, req: Request):
+    require_node_key(req)
+    ensure_instance(name)
+    proto = i.proto.lower()
+    if proto not in ("tcp","udp"):
+        raise HTTPException(status_code=400, detail="proto must be tcp or udp")
+
+    host_port = i.host_port or allocate_port()
+
+    # proxy device
+    devname = f"p{host_port}{proto}"
+    lxc(["config","device","add",name,devname,"proxy",
+         f"listen={proto}:0.0.0.0:{host_port}",
+         f"connect={proto}:127.0.0.1:{i.container_port}"])
+
+    save_port(host_port, proto, name, i.container_port)
+    return {"ok": True, "host_port": host_port, "container_port": i.container_port, "proto": proto}
+
+@APP.delete("/instances/{name}/ports/{host_port}")
+def del_port_map(name: str, host_port: int, req: Request):
+    require_node_key(req)
+    ensure_instance(name)
+    r = del_port(host_port)
+
+    # remove proxy device by scanning config show
+    out = lxc(["config","show",name])
+    dev_to_del = None
+    for line in out.splitlines():
+        if line.strip().startswith("p") and f"{host_port}" in line:
+            # device key line, ex: p20001tcp:
+            if line.strip().endswith(":"):
+                dev_to_del = line.strip().rstrip(":")
+                break
+    if dev_to_del:
+        try:
+            lxc(["config","device","remove",name,dev_to_del])
+        except HTTPException:
+            pass
+
+    return {"ok": True, "deleted": r}
+
+class ReinstallIn(BaseModel):
+    image: str
+    preserve_ports: bool = True
+    preserve_limits: bool = True
+
+@APP.post("/instances/{name}/reinstall")
+def reinstall(name: str, i: ReinstallIn, req: Request):
+    require_node_key(req)
+    ensure_instance(name)
+
+    # snapshot mappings & limits
+    ports = []
+    if i.preserve_ports:
+        con = db()
+        ports = [dict(r) for r in con.execute("SELECT host_port,proto,container_port FROM ports WHERE container_name=?", (name,)).fetchall()]
+        con.close()
+
+    limits_cfg = {}
+    if i.preserve_limits:
+        out = lxc(["config","get",name,"limits.cpu"])
+        if out.strip(): limits_cfg["limits.cpu"] = out.strip()
+        out = lxc(["config","get",name,"limits.cpu.allowance"])
+        if out.strip(): limits_cfg["limits.cpu.allowance"] = out.strip()
+        out = lxc(["config","get",name,"limits.memory"])
+        if out.strip(): limits_cfg["limits.memory"] = out.strip()
+
+    # delete container
+    try:
+        lxc(["stop", name, "--force"], timeout=60)
+    except HTTPException:
+        pass
+    lxc(["delete", name, "--force"], timeout=60)
+
+    # recreate
+    lxc(["init", i.image, name])
+    for k,v in limits_cfg.items():
+        lxc(["config","set",name,k,v])
+    lxc(["start", name])
+
+    # restore ports
+    for p in ports:
+        # try add again, ignore errors
+        try:
+            host_port = int(p["host_port"])
+            proto = p["proto"]
+            cport = int(p["container_port"])
+            devname = f"p{host_port}{proto}"
+            lxc(["config","device","add",name,devname,"proxy",
+                 f"listen={proto}:0.0.0.0:{host_port}",
+                 f"connect={proto}:127.0.0.1:{cport}"])
+            # ensure db
+            con = db()
+            con.execute("INSERT OR IGNORE INTO ports(host_port,proto,container_name,container_port,created_at) VALUES(?,?,?,?,?)",
+                        (host_port, proto, name, cport, int(time.time())))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    return {"ok": True, "name": name, "image": i.image}
+
+class UserIn(BaseModel):
+    username: str
     password: Optional[str] = None
     ssh_public_key: Optional[str] = None
     sudo: bool = True
 
-@app.get("/node/health")
-def node_health(_=Depends(require_panel)):
-    return {"ok":True,"name":APP_NAME,"node_id":NODE_ID,"ts":datetime.utcnow().isoformat()+"Z"}
+@APP.post("/instances/{name}/users")
+def create_user(name: str, i: UserIn, req: Request):
+    require_node_key(req)
+    ensure_instance(name)
 
-@app.get("/instances")
-def list_instances(_=Depends(require_panel)):
-    return {"instances": lxc_json(["list"])}
+    # useradd + password + sudo + ssh key
+    # NOTE: relies on container having useradd, chpasswd, sudo, etc.
+    cmds = [
+        f"id -u {i.username} >/dev/null 2>&1 || useradd -m {i.username}"
+    ]
+    if i.password:
+        cmds.append(f"echo '{i.username}:{i.password}' | chpasswd")
+    if i.sudo:
+        cmds.append(f"usermod -aG sudo {i.username} || true")
+    if i.ssh_public_key:
+        cmds.append(f"mkdir -p /home/{i.username}/.ssh")
+        cmds.append(f"echo '{i.ssh_public_key}' >> /home/{i.username}/.ssh/authorized_keys")
+        cmds.append(f"chown -R {i.username}:{i.username} /home/{i.username}/.ssh")
+        cmds.append(f"chmod 700 /home/{i.username}/.ssh && chmod 600 /home/{i.username}/.ssh/authorized_keys")
 
-@app.post("/instances")
-def create_instance(req:CreateInstanceReq, _=Depends(require_panel)):
-    args=["launch", req.image, req.name]
-    for p in req.profiles: args += ["-p", p]
-    run_lxc(args, timeout=600)
-
-    if req.cpu_cores: run_lxc(["config","set",req.name,"limits.cpu",str(req.cpu_cores)])
-    if req.cpu_limit_percent: run_lxc(["config","set",req.name,"limits.cpu.allowance",f"{req.cpu_limit_percent}%"])
-    if req.memory_mb: run_lxc(["config","set",req.name,"limits.memory",f"{req.memory_mb}MB"])
-    if req.disk_gb:
-        try: run_lxc(["config","device","set",req.name,"root","size",f"{req.disk_gb}GB"])
-        except HTTPException: pass
-
-    if req.up_mbit or req.down_mbit:
-        dev=get_host_veth(req.name)
-        tc_limit(dev, req.up_mbit, req.down_mbit)
-
-    audit("instance.create", req.model_dump())
-    return {"ok":True,"name":req.name}
-
-@app.post("/instances/{name}/limits")
-def set_limits(name:str, req:LimitReq, _=Depends(require_panel)):
-    if req.cpu_cores: run_lxc(["config","set",name,"limits.cpu",str(req.cpu_cores)])
-    if req.cpu_limit_percent: run_lxc(["config","set",name,"limits.cpu.allowance",f"{req.cpu_limit_percent}%"])
-    if req.memory_mb: run_lxc(["config","set",name,"limits.memory",f"{req.memory_mb}MB"])
-    if req.disk_gb:
-        try: run_lxc(["config","device","set",name,"root","size",f"{req.disk_gb}GB"])
-        except HTTPException: pass
-    if req.up_mbit or req.down_mbit:
-        dev=get_host_veth(name)
-        tc_limit(dev, req.up_mbit, req.down_mbit)
-    audit("limits.set", {"name":name, **req.model_dump()})
-    return {"ok":True}
-
-@app.get("/ports")
-def list_ports(_=Depends(require_panel)):
-    ensure_port_rows()
-    c=db()
-    rows=c.execute("SELECT * FROM ports ORDER BY host_port").fetchall()
-    c.close()
-    return {"ports":[dict(r) for r in rows]}
-
-@app.post("/instances/{name}/ports")
-def add_port(name:str, req:PortMapReq, _=Depends(require_panel)):
-    host_port = int(req.host_port) if req.host_port else allocate_port(name, req.container_port, req.proto)
-    ip = get_inst_ipv4(name)
-    dev_name=f"p{host_port}-{req.proto}"
-    listen=f"{req.proto}:0.0.0.0:{host_port}"
-    connect=f"{req.proto}:{ip}:{req.container_port}"
-
-    try: run_lxc(["config","device","remove",name,dev_name])
-    except HTTPException: pass
-    run_lxc(["config","device","add",name,dev_name,"proxy",f"listen={listen}",f"connect={connect}"])
-    audit("port.add", {"name":name,"host_port":host_port,"container_port":req.container_port,"proto":req.proto})
-    return {"ok":True,"host_port":host_port,"container_ip":ip,"device":dev_name}
-
-@app.delete("/instances/{name}/ports/{host_port}")
-def del_port(name:str, host_port:int, _=Depends(require_panel)):
-    for proto in ("tcp","udp"):
-        dev_name=f"p{int(host_port)}-{proto}"
-        try: run_lxc(["config","device","remove",name,dev_name])
-        except HTTPException: pass
-    release_port(int(host_port))
-    audit("port.del", {"name":name,"host_port":int(host_port)})
-    return {"ok":True}
-
-@app.post("/instances/{name}/reinstall")
-def reinstall(name:str, req:ReinstallReq, _=Depends(require_panel)):
-    inst=lxc_json(["query", f"/1.0/instances/{name}"])
-    config=inst.get("config",{})
-    devices=inst.get("devices",{})
-    profiles=inst.get("profiles",[DEFAULT_PROFILE])
-
-    c=db()
-    ports=c.execute("SELECT host_port,container_port,proto FROM ports WHERE in_use=1 AND container=?", (name,)).fetchall()
-    c.close()
-
-    try: run_lxc(["stop",name,"--force"], timeout=120)
-    except HTTPException: pass
-    run_lxc(["delete",name,"--force"], timeout=300)
-
-    args=["launch", req.image, name]
-    for p in profiles: args += ["-p", p]
-    run_lxc(args, timeout=600)
-
-    if req.preserve_limits:
-        for k,v in config.items():
-            if k.startswith("volatile."): continue
-            try: run_lxc(["config","set",name,k,v])
-            except HTTPException: pass
-
-    for dev_name, dev in devices.items():
-        if dev_name in ("eth0","root"): continue
-        dtype=dev.get("type")
-        if not dtype: continue
-        cmd=["config","device","add",name,dev_name,dtype]
-        for k,v in dev.items():
-            if k=="type": continue
-            cmd.append(f"{k}={v}")
-        try: run_lxc(cmd)
-        except HTTPException: pass
-
-    if req.preserve_ports and ports:
-        ip=get_inst_ipv4(name)
-        for r in ports:
-            hp=int(r["host_port"]); cp=int(r["container_port"]); proto=str(r["proto"] or "tcp")
-            dev_name=f"p{hp}-{proto}"
-            listen=f"{proto}:0.0.0.0:{hp}"
-            connect=f"{proto}:{ip}:{cp}"
-            try: run_lxc(["config","device","remove",name,dev_name])
-            except HTTPException: pass
-            run_lxc(["config","device","add",name,dev_name,"proxy",f"listen={listen}",f"connect={connect}"])
-
-    audit("instance.reinstall", {"name":name, **req.model_dump()})
-    return {"ok":True}
-
-@app.post("/instances/{name}/users")
-def create_linux_user(name:str, req:LinuxUserReq, _=Depends(require_panel)):
-    try:
-        run_lxc(["start", name], timeout=120)
-    except HTTPException:
-        pass
-
-    u=req.username
-    cmds=[]
-    cmds.append(f"id -u {u} >/dev/null 2>&1 || useradd -m -s /bin/bash {u}")
-    if req.password:
-        cmds.append(f"printf '{u}:{req.password}' | chpasswd")
-    if req.sudo:
-        cmds.append(f"usermod -aG sudo {u} || true")
-        cmds.append(f"echo '{u} ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/{u} && chmod 440 /etc/sudoers.d/{u}")
-    if req.ssh_public_key:
-        cmds.append(f"mkdir -p /home/{u}/.ssh && chmod 700 /home/{u}/.ssh")
-        cmds.append(f"grep -qxF '{req.ssh_public_key}' /home/{u}/.ssh/authorized_keys 2>/dev/null || echo '{req.ssh_public_key}' >> /home/{u}/.ssh/authorized_keys")
-        cmds.append(f"chmod 600 /home/{u}/.ssh/authorized_keys")
-        cmds.append(f"chown -R {u}:{u} /home/{u}/.ssh")
-
-    script=" && ".join(cmds)
-    run_lxc(["exec", name, "--", "bash", "-lc", script], timeout=180)
-    audit("linux_user.create", {"name":name, "username":u, "sudo":req.sudo, "has_ssh_key": bool(req.ssh_public_key)})
-    return {"ok":True, "username":u}
+    script = " && ".join(cmds)
+    lxc(["exec", name, "--", "bash", "-lc", script], timeout=60)
+    return {"ok": True, "username": i.username}
 PY
-  ok "Node-Agent 代码写入完成"
-}
 
-node_setup_venv() {
+  if [[ ! -d "$NODE_DIR/venv" ]]; then
+    info "创建 Node-Agent venv..."
+    python3 -m venv "$NODE_DIR/venv"
+  fi
   info "安装 Node-Agent Python 依赖..."
-  python3 -m venv "${NODE_DIR}/venv"
-  "${NODE_DIR}/venv/bin/pip" install --upgrade pip >/dev/null
-  "${NODE_DIR}/venv/bin/pip" install -r "${NODE_DIR}/requirements.txt" >/dev/null
+  "$NODE_DIR/venv/bin/pip" -q install --upgrade pip >/dev/null
+  "$NODE_DIR/venv/bin/pip" -q install -r "$NODE_DIR/requirements.txt" >/dev/null
   ok "Node-Agent 依赖安装完成"
-}
 
-node_enroll_and_write_env() {
-  local panel_url pair_token node_name node_url ip resp node_id node_secret lxd_sock
-  read -r -p "请输入 Panel URL（例如 http://1.2.3.4:${PANEL_API_PORT}）: " panel_url
-  read -r -p "请输入 Pair Token（在 Panel 生成）: " pair_token
-  [[ -n "$panel_url" && -n "$pair_token" ]] || die "Panel URL / Pair Token 不能为空"
-
-  node_name="$(hostname -s 2>/dev/null || echo node)"
-  ip="$(host_ip)"
-  node_url="http://${ip}:${NODE_PORT}"
-  lxd_sock="$(detect_lxd_socket)"
-
-  info "向 Panel enroll 注册节点..."
-  resp="$(curl -sS "${panel_url%/}/nodes/enroll" \
-    -H 'Content-Type: application/json' \
-    -d "{\"token\":\"${pair_token}\",\"name\":\"${node_name}\",\"url\":\"${node_url}\"}")" || true
-
-  node_id="$(echo "$resp" | jq -r '.node_id // empty')"
-  node_secret="$(echo "$resp" | jq -r '.node_secret // empty')"
-  [[ -n "$node_id" && -n "$node_secret" ]] || die "Enroll 失败：$resp"
-
-  cat > "${CFG_DIR}/node.env" << EOF
-NODE_DB=${DATA_DIR}/node.db
-NODE_ID=${node_id}
-NODE_SECRET=${node_secret}
-
-NODE_PORT_MIN=${PORT_MIN}
-NODE_PORT_MAX=${PORT_MAX}
-NODE_DEFAULT_PROFILE=${DEFAULT_PROFILE}
-EOF
-  chmod 600 "${CFG_DIR}/node.env"
-  echo "$node_id" > "${CFG_DIR}/node.id"; chmod 600 "${CFG_DIR}/node.id"
-  echo "${node_url}" > "${CFG_DIR}/node.url"; chmod 600 "${CFG_DIR}/node.url"
-  echo "${panel_url%/}" > "${CFG_DIR}/node.panel_url"; chmod 600 "${CFG_DIR}/node.panel_url"
-
-  ok "节点已注册：node_id=${node_id}"
-  ok "Node-Agent 将监听：${node_url}"
-  warn "强烈建议：Panel/Node 之间走内网/VPN 或 mTLS 反代"
-}
-
-node_systemd() {
-  info "注册 Node-Agent systemd..."
-  cat > "/etc/systemd/system/${NODE_SERVICE}.service" << EOF
+  cat > "/etc/systemd/system/${NODE_SVC}.service" <<EOF
 [Unit]
-Description=LXD Node-Agent v2 (LXD host)
-After=network.target lxd.service
-Wants=lxd.service
+Description=LXD Node-Agent (FastAPI)
+After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=${CFG_DIR}/node.env
-WorkingDirectory=${NODE_DIR}
-ExecStart=${NODE_DIR}/venv/bin/uvicorn app.main:app --host ${NODE_BIND_ADDR} --port ${NODE_PORT} --proxy-headers
+EnvironmentFile=${NODE_ETC}/node.conf
+ExecStart=${NODE_DIR}/venv/bin/uvicorn agent:APP --app-dir ${NODE_DIR} --host \${NODE_HOST} --port \${NODE_PORT}
 Restart=always
 RestartSec=2
 User=root
+WorkingDirectory=${NODE_DIR}
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=${DATA_DIR} ${LOG_DIR} ${CFG_DIR} ${NODE_DIR}
+ReadWritePaths=${NODE_DIR} ${NODE_ETC} ${NODE_DATA}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable "${NODE_SERVICE}" >/dev/null
-  systemctl restart "${NODE_SERVICE}"
-  ok "Node-Agent 服务已启动：${NODE_SERVICE}"
+  systemd_reload
+  svc_start "$NODE_SVC"
+  ok "Node-Agent 服务已启动：${NODE_SVC}"
 }
 
-node_install_and_enroll() {
-  install_pkgs_common
-  ensure_dirs
+# ------------ UX prints ------------
+print_panel_info(){
+  local ip
+  ip="$(detect_ip)"
+  local pass
+  pass="$(cat "$PANEL_ETC/panel.admin.pass" 2>/dev/null || echo '(missing)')"
 
-  install_lxd_if_needed
-  init_lxd_if_needed
-
-  mkdir -p "${NODE_DIR}"
-  write_node_app
-  node_setup_venv
-
-  node_enroll_and_write_env
-  node_systemd
-
-  systemctl is-active --quiet "${NODE_SERVICE}" && ok "Node-Agent 安装成功" || warn "Node-Agent 服务未正常运行"
-  node_show_info
+  echo
+  echo -e "${GREEN}==================== Panel 对接信息（可复制）====================${PLAIN}"
+  echo -e "Panel API Base : ${BLUE}http://${ip}:${PANEL_PORT}${PLAIN}"
+  echo -e "Admin Username : ${YELLOW}admin${PLAIN}"
+  echo -e "Admin Password : ${YELLOW}${pass}${PLAIN}"
+  echo -e "Admin Pass File: ${BLUE}${PANEL_ETC}/panel.admin.pass${PLAIN}"
+  echo -e "Health Check   : ${BLUE}curl -s http://127.0.0.1:${PANEL_PORT}/health${PLAIN}"
+  echo -e "${GREEN}===============================================================${PLAIN}"
+  echo
+  echo -e "${YELLOW}下一步建议：${PLAIN}"
+  echo -e "  1) 选【3】生成 pair_token"
+  echo -e "  2) 去节点机运行本脚本选【4】安装 Node-Agent 并 enroll"
+  echo -e "  3) 回来选【5】查看节点对接信息（确认在线）"
+  echo
 }
 
-node_show_info() {
-  local ip node_id node_url panel_url
-  ip="$(host_ip)"
-  node_id="$(cat "${CFG_DIR}/node.id" 2>/dev/null || true)"
-  node_url="$(cat "${CFG_DIR}/node.url" 2>/dev/null || echo "http://${ip}:${NODE_PORT}")"
-  panel_url="$(cat "${CFG_DIR}/node.panel_url" 2>/dev/null || true)"
-
-  echo -e "\n${GREEN}================= Node 对接信息 =================${PLAIN}"
-  echo -e "Node-Agent URL: ${BLUE}${node_url}${PLAIN}"
-  echo -e "Node ID       : ${YELLOW}${node_id:-未注册}${PLAIN}"
-  echo -e "Panel URL     : ${YELLOW}${panel_url:-未知}${PLAIN}"
-  echo -e "\n注意：Node-Agent 默认不对外开放给前端，建议只让 Panel 访问。"
-  echo -e "Panel 侧调用示例："
-  cat << EOF
-  # 先在 Panel 上登录拿 JWT：TOKEN=...
-  # 然后通过 Panel 代理请求此节点：
-  curl -s ${panel_url:-http://PANEL_IP:${PANEL_API_PORT}}/nodes/${node_id:-NODE_ID}/instances \\
-    -H "Authorization: Bearer \$TOKEN" | jq
-EOF
-  echo -e "${GREEN}=================================================${PLAIN}\n"
-
-  # 本机自检（仅确认监听，不暴露 secret）
-  echo "监听检查：ss -lntp | grep -E '(:${NODE_PORT}|uvicorn)' || true"
+print_node_info(){
+  local ip node_key
+  ip="$(detect_ip)"
+  node_key="$(cat "$NODE_ETC/node.key" 2>/dev/null || echo '(missing)')"
+  echo
+  echo -e "${GREEN}==================== Node-Agent 对接信息 ====================${PLAIN}"
+  echo -e "Node URL    : ${BLUE}http://${ip}:${NODE_PORT}${PLAIN}"
+  echo -e "Node Key    : ${YELLOW}${node_key}${PLAIN}  (Panel enroll 成功后由 Panel 保存，无需你手填)"
+  echo -e "Health Test : ${BLUE}curl -s -H 'X-Node-Key: ${node_key}' http://127.0.0.1:${NODE_PORT}/health${PLAIN}"
+  echo -e "${GREEN}=============================================================${PLAIN}"
+  echo
 }
 
-node_uninstall() {
-  warn "卸载 Node-Agent..."
-  read -r -p "是否保留数据（node.db/日志）？[y/N]: " keep
-  keep="${keep:-N}"
+# ------------ actions ------------
+install_panel(){
+  apt_install
+  write_panel_app
 
-  systemctl stop "${NODE_SERVICE}" >/dev/null 2>&1 || true
-  systemctl disable "${NODE_SERVICE}" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${NODE_SERVICE}.service"
-  systemctl daemon-reload
-
-  rm -rf "${NODE_DIR}" || true
-  rm -f "${CFG_DIR}/node.env" "${CFG_DIR}/node.id" "${CFG_DIR}/node.url" "${CFG_DIR}/node.panel_url" || true
-
-  if [[ "${keep}" =~ ^[Yy]$ ]]; then
-    ok "已卸载 Node-Agent（保留数据：${DATA_DIR} / ${LOG_DIR}）"
+  info "验证 Panel /health..."
+  local h
+  h="$(curl_local "http://127.0.0.1:${PANEL_PORT}/health")"
+  if [[ -z "$h" ]]; then
+    warn "Panel /health 未响应。请检查服务：systemctl status ${PANEL_SVC}"
+    svc_status_hint "$PANEL_SVC"
   else
-    # 注意：这里会把 panel.db 一起删掉（如果同机装了 Panel）。因此只删 node.db 更稳。
-    # 采用“只删 node.db”的策略。
-    rm -f "${DATA_DIR}/node.db" || true
-    ok "已卸载 Node-Agent（node.db 已清理；panel.db 未动）"
+    ok "Panel /health 响应：$h"
+  fi
+
+  # 宝塔式：安装后立刻打印对接信息
+  print_panel_info
+}
+
+show_panel_api(){
+  if [[ ! -f "$PANEL_ETC/panel.admin.pass" ]]; then
+    warn "未检测到 Panel 配置。请先选【1】安装 Panel。"
+    return
+  fi
+  print_panel_info
+}
+
+gen_pair_token(){
+  if [[ ! -f "$PANEL_ETC/panel.admin.pass" ]]; then
+    warn "未检测到 Panel。请先选【1】安装 Panel。"
+    return
+  fi
+  local ip pass token
+  ip="$(detect_ip)"
+  pass="$(cat "$PANEL_ETC/panel.admin.pass")"
+
+  info "向 Panel 申请 JWT..."
+  local jwt
+  jwt="$(curl -sS -X POST "http://127.0.0.1:${PANEL_PORT}/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"${pass}\"}" | jq -r '.token' 2>/dev/null || true)"
+
+  if [[ -z "$jwt" || "$jwt" == "null" ]]; then
+    err "获取 JWT 失败。请检查 Panel 是否正常：curl http://127.0.0.1:${PANEL_PORT}/health"
+    return
+  fi
+
+  read -r -p "请输入 token 有效期（秒，默认600）: " ttl
+  ttl="${ttl:-600}"
+
+  info "生成 pair_token..."
+  token="$(curl -sS -X POST "http://127.0.0.1:${PANEL_PORT}/nodes/pair_token?ttl_seconds=${ttl}" \
+    -H "Authorization: Bearer ${jwt}" | jq -r '.token' 2>/dev/null || true)"
+
+  if [[ -z "$token" || "$token" == "null" ]]; then
+    err "生成 pair_token 失败"
+    return
+  fi
+
+  echo
+  echo -e "${GREEN}==================== Pair Token（复制给节点机）====================${PLAIN}"
+  echo -e "PAIR_TOKEN=${YELLOW}${token}${PLAIN}"
+  echo -e "${GREEN}===============================================================${PLAIN}"
+  echo
+  echo -e "${YELLOW}下一步：${PLAIN}去节点机运行本脚本，选【4】安装 Node-Agent 并对接，粘贴上面的 PAIR_TOKEN"
+  echo
+}
+
+install_node_and_enroll(){
+  apt_install
+  ensure_lxd
+  write_node_app
+  print_node_info
+
+  # enroll
+  read -r -p "请输入 Panel URL（例如 http://PANEL_IP:9876）: " panel_url
+  panel_url="${panel_url%/}"
+  if [[ -z "$panel_url" ]]; then
+    warn "Panel URL 为空，跳过 enroll。你可稍后在菜单里重做此步骤。"
+    return
+  fi
+  read -r -p "请输入 Pair Token（PAIR_TOKEN= 后面的内容）: " pair_token
+  if [[ -z "${pair_token}" ]]; then
+    warn "Pair Token 为空，跳过 enroll。"
+    return
+  fi
+  read -r -p "请输入节点名称（默认 node-$(hostname)）: " node_name
+  node_name="${node_name:-node-$(hostname)}"
+
+  local node_url
+  node_url="http://$(detect_ip):${NODE_PORT}"
+
+  info "向 Panel enroll（注册节点）..."
+  local resp
+  resp="$(curl -sS -X POST "${panel_url}/nodes/enroll" \
+    -H "Content-Type: application/json" \
+    -d "{\"token\":\"${pair_token}\",\"name\":\"${node_name}\",\"url\":\"${node_url}\"}" || true)"
+
+  echo
+  echo -e "${GREEN}==================== enroll 返回（请保存）====================${PLAIN}"
+  echo "$resp"
+  echo -e "${GREEN}============================================================${PLAIN}"
+  echo
+
+  # try basic verify (if Panel is same host, can check nodes list; otherwise admin later)
+  echo -e "${YELLOW}说明：${PLAIN}Panel 已保存 node_key，用于之后代理调用 Node-Agent。"
+  echo
+}
+
+show_nodes(){
+  if [[ ! -f "$PANEL_ETC/panel.admin.pass" ]]; then
+    warn "未检测到 Panel。请先选【1】安装 Panel。"
+    return
+  fi
+  local pass jwt
+  pass="$(cat "$PANEL_ETC/panel.admin.pass")"
+  jwt="$(curl -sS -X POST "http://127.0.0.1:${PANEL_PORT}/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"${pass}\"}" | jq -r '.token' 2>/dev/null || true)"
+  if [[ -z "$jwt" || "$jwt" == "null" ]]; then
+    err "获取 JWT 失败"
+    return
+  fi
+  info "读取节点列表..."
+  local nodes
+  nodes="$(curl -sS "http://127.0.0.1:${PANEL_PORT}/nodes" -H "Authorization: Bearer ${jwt}" || true)"
+  echo
+  echo -e "${GREEN}==================== Node 列表 ====================${PLAIN}"
+  echo "$nodes" | jq . 2>/dev/null || echo "$nodes"
+  echo -e "${GREEN}==================================================${PLAIN}"
+  echo
+
+  # if any node_id, offer quick health check
+  local first_id
+  first_id="$(echo "$nodes" | jq -r '.nodes[0].id // empty' 2>/dev/null || true)"
+  if [[ -n "$first_id" ]]; then
+    read -r -p "是否对第一个节点做 health 检测？(y/N): " yn
+    yn="${yn:-N}"
+    if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
+      local h
+      h="$(curl -sS "http://127.0.0.1:${PANEL_PORT}/nodes/${first_id}/health" -H "Authorization: Bearer ${jwt}" || true)"
+      echo
+      echo -e "${GREEN}==================== Node Health ===================${PLAIN}"
+      echo "$h" | jq . 2>/dev/null || echo "$h"
+      echo -e "${GREEN}===================================================${PLAIN}"
+      echo
+    fi
+  else
+    warn "暂无节点。请先在节点机选【4】安装 Node-Agent 并 enroll。"
   fi
 }
 
-# ==============================================================================
-# Pair Token helper (Panel side)
-# ==============================================================================
-panel_create_pair_token() {
-  local ip admin_pass ttl token resp
-  ip="$(host_ip)"
+uninstall_panel(){
+  warn "将卸载 Panel（可选择保留数据）。"
+  read -r -p "是否保留数据目录 ${PANEL_DATA} ? (y/N): " keep
+  keep="${keep:-N}"
 
-  [[ -f "${CFG_DIR}/panel.admin.pass" ]] || die "找不到 ${CFG_DIR}/panel.admin.pass（请先安装 Panel）"
-  admin_pass="$(cat "${CFG_DIR}/panel.admin.pass")"
+  svc_stop "$PANEL_SVC"
+  rm -f "/etc/systemd/system/${PANEL_SVC}.service"
+  systemd_reload
 
-  read -r -p "Pair Token 有效期秒数（60~3600，默认600）: " ttl
-  ttl="${ttl:-600}"
+  rm -rf "$PANEL_DIR"
+  rm -rf "$PANEL_ETC"
 
-  # login -> token
-  token="$(curl -s "http://${ip}:${PANEL_API_PORT}/auth/login" \
-    -H 'Content-Type: application/json' \
-    -d "{\"username\":\"admin\",\"password\":\"${admin_pass}\"}" | jq -r .token)"
-
-  [[ -n "$token" && "$token" != "null" ]] || die "登录失败：请检查 Panel 是否运行 / 密码是否正确"
-
-  resp="$(curl -s "http://${ip}:${PANEL_API_PORT}/nodes/pair_token?ttl_seconds=${ttl}" \
-    -H "Authorization: Bearer ${token}")"
-
-  echo -e "\n${GREEN}================= Pair Token =================${PLAIN}"
-  echo "$resp" | jq
-  echo -e "\n把上面的 token 粘到节点机上执行：菜单 4（安装 Node 并对接）"
-  echo -e "${GREEN}==============================================${PLAIN}\n"
+  if [[ "$keep" == "y" || "$keep" == "Y" ]]; then
+    warn "已保留数据目录：${PANEL_DATA}"
+  else
+    rm -rf "$PANEL_DATA"
+    ok "已删除数据目录：${PANEL_DATA}"
+  fi
+  ok "Panel 卸载完成"
 }
 
-# ==============================================================================
-# Menu
-# ==============================================================================
-menu() {
-  echo -e "${GREEN}
-================= LXD Panel v2 菜单 =================
-1) 安装 Panel 后端（中心端）
-2) 显示 Panel 对接 API
-3) 生成节点配对 Token（pair_token）
-4) 安装 Node-Agent 并对接到 Panel（enroll）
-5) 显示 Node 对接信息
-6) 卸载 Panel（可选保留数据）
-7) 卸载 Node-Agent（可选保留数据）
-0) 退出
-=====================================================
-${PLAIN}"
-  read -r -p "请选择 [0-7]: " choice
-  case "${choice}" in
-    1) panel_install ;;
-    2) panel_show_api ;;
-    3) panel_create_pair_token ;;
-    4) node_install_and_enroll ;;
-    5) node_show_info ;;
-    6) panel_uninstall ;;
-    7) node_uninstall ;;
-    0) exit 0 ;;
-    *) warn "无效选项" ;;
-  esac
+uninstall_node(){
+  warn "将卸载 Node-Agent（可选择保留数据）。"
+  read -r -p "是否保留数据目录 ${NODE_DATA} ? (y/N): " keep
+  keep="${keep:-N}"
+
+  svc_stop "$NODE_SVC"
+  rm -f "/etc/systemd/system/${NODE_SVC}.service"
+  systemd_reload
+
+  rm -rf "$NODE_DIR"
+  rm -rf "$NODE_ETC"
+
+  if [[ "$keep" == "y" || "$keep" == "Y" ]]; then
+    warn "已保留数据目录：${NODE_DATA}"
+  else
+    rm -rf "$NODE_DATA"
+    ok "已删除数据目录：${NODE_DATA}"
+  fi
+  ok "Node-Agent 卸载完成"
 }
 
-# ==============================================================================
-# Entry
-# ==============================================================================
-ensure_dirs
-menu
+# ------------ menu loop ------------
+menu(){
+  clear
+  echo -e "${GREEN}=========== LXD Panel v2 菜单（宝塔式交互）===========${PLAIN}"
+  echo -e "1) 安装 Panel 后端（中心端）"
+  echo -e "2) 显示 Panel 对接 API / 管理员账号密码"
+  echo -e "3) 生成节点配对 Token (pair_token)"
+  echo -e "4) 安装 Node-Agent 并对接到 Panel (enroll)"
+  echo -e "5) 显示 Node 对接信息 / 节点列表（Panel侧）"
+  echo -e "6) 卸载 Panel（可选保留数据）"
+  echo -e "7) 卸载 Node-Agent（可选保留数据）"
+  echo -e "0) 退出"
+  echo -e "${GREEN}====================================================${PLAIN}"
+  echo
+}
+
+main(){
+  need_root
+  while true; do
+    menu
+    read -r -p "请选择: " c
+    case "${c:-}" in
+      1) install_panel; pause;;
+      2) show_panel_api; pause;;
+      3) gen_pair_token; pause;;
+      4) install_node_and_enroll; pause;;
+      5) 
+         echo
+         if [[ -f "$NODE_ETC/node.key" ]]; then
+           print_node_info
+         else
+           warn "本机未安装 Node-Agent。"
+         fi
+         if [[ -f "$PANEL_ETC/panel.admin.pass" ]]; then
+           show_nodes
+         else
+           warn "本机未安装 Panel。"
+         fi
+         pause
+         ;;
+      6) uninstall_panel; pause;;
+      7) uninstall_node; pause;;
+      0) exit 0;;
+      *) warn "无效选择"; sleep 1;;
+    esac
+  done
+}
+
+main
