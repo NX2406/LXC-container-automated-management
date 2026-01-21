@@ -15,7 +15,7 @@
 直接在终端执行以下命令即可启动管理面板：
 
 ```bash
-bash <(curl -sL [https://raw.githubusercontent.com/NX2406/LXC-container-automated-management/main/lxc](https://raw.githubusercontent.com/NX2406/LXC-container-automated-management/main/lxc))
+bash <(curl -sL https://raw.githubusercontent.com/NX2406/LXC-container-automated-management/main/lxc)
 ```
 
 ---
