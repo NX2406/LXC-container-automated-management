@@ -1,0 +1,390 @@
+#!/bin/bash
+
+# ==============================================================
+# LXD Secure Agent - 一键交互式管理脚本
+# 功能：mTLS安全认证、LXD容器管理API、交互式菜单、令牌管理
+# ==============================================================
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+PLAIN='\033[0m'
+
+# 核心配置
+AGENT_DIR="/opt/lxd-agent"
+DATA_DIR="${AGENT_DIR}/data"
+CERT_DIR="${AGENT_DIR}/certs"
+LOG_DIR="/var/log/lxd-agent"
+PY_VENV="${AGENT_DIR}/.venv"
+UVICORN_PORT="9042"
+NGINX_HTTPS_PORT="443"
+
+# 检查是否为 Root
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 权限运行此脚本！${PLAIN}" && exit 1
+
+# --- 辅助函数 ---
+
+function print_title() {
+    clear
+    echo -e "${CYAN}==========================================================${PLAIN}"
+    echo -e "${CYAN}           LXD Secure Agent 一键管理脚本 v1.0             ${PLAIN}"
+    echo -e "${CYAN}==========================================================${PLAIN}"
+    echo -e "适用于 Debian 11+ / Ubuntu 20.04+ | 架构: AMD64/ARM64"
+    echo ""
+}
+
+function install_dependencies() {
+    echo -e "${YELLOW}[*] 正在安装基础依赖 (curl, jq, nginx, python3...)${PLAIN}"
+    apt-get update -qq
+    apt-get install -y -qq curl jq openssl nginx python3 python3-venv python3-pip ufw >/dev/null
+}
+
+function check_lxd() {
+    echo -e "${YELLOW}[*] 检查 LXD 环境...${PLAIN}"
+    if ! command -v snap >/dev/null 2>&1; then
+        apt-get install -y snapd >/dev/null
+    fi
+    if ! snap list 2>/dev/null | grep -q '^lxd '; then
+        echo "    正在安装 LXD (snap)..."
+        snap install lxd
+    fi
+    
+    # 自动初始化 LXD
+    if ! lxc info >/dev/null 2>&1; then
+        echo "    正在初始化 LXD (默认配置)..."
+        lxd init --auto
+    else
+        echo -e "${GREEN}    LXD 运行正常${PLAIN}"
+    fi
+}
+
+function generate_certs() {
+    echo -e "${YELLOW}[*] 正在生成 mTLS 双向认证证书...${PLAIN}"
+    mkdir -p "${CERT_DIR}"
+    
+    CA_KEY="${CERT_DIR}/ca.key"
+    CA_CRT="${CERT_DIR}/ca.crt"
+    SRV_KEY="${CERT_DIR}/server.key"
+    SRV_CRT="${CERT_DIR}/server.crt"
+    PANEL_KEY="${CERT_DIR}/panel-client.key"
+    PANEL_CRT="${CERT_DIR}/panel-client.crt"
+    
+    HOST_FQDN="$(hostname -f 2>/dev/null || hostname)"
+    HOST_IP="$(hostname -I | awk '{print $1}')"
+    SERVER_CN="lxd-agent-${HOST_FQDN}"
+
+    # 1. CA
+    if [[ ! -f "${CA_CRT}" ]]; then
+        openssl genrsa -out "${CA_KEY}" 4096 2>/dev/null
+        openssl req -x509 -new -nodes -key "${CA_KEY}" -sha256 -days 3650 \
+            -subj "/CN=LXDPanel-CA" -out "${CA_CRT}" 2>/dev/null
+    fi
+
+    # 2. Server Cert
+    if [[ ! -f "${SRV_CRT}" ]]; then
+        openssl genrsa -out "${SRV_KEY}" 2048 2>/dev/null
+        cat > "${CERT_DIR}/server.cnf" <<EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+req_extensions = req_ext
+distinguished_name = dn
+[dn]
+CN = ${SERVER_CN}
+[req_ext]
+subjectAltName = @alt_names
+[alt_names]
+DNS.1 = ${HOST_FQDN}
+IP.1 = ${HOST_IP}
+EOF
+        openssl req -new -key "${SRV_KEY}" -out "${CERT_DIR}/server.csr" -config "${CERT_DIR}/server.cnf" 2>/dev/null
+        openssl x509 -req -in "${CERT_DIR}/server.csr" -CA "${CA_CRT}" -CAkey "${CA_KEY}" -CAcreateserial \
+            -out "${SRV_CRT}" -days 825 -sha256 -extensions req_ext -extfile "${CERT_DIR}/server.cnf" 2>/dev/null
+    fi
+
+    # 3. Client Cert
+    if [[ ! -f "${PANEL_CRT}" ]]; then
+        openssl genrsa -out "${PANEL_KEY}" 2048 2>/dev/null
+        openssl req -new -key "${PANEL_KEY}" -subj "/CN=LXDPanel-Client" -out "${CERT_DIR}/panel-client.csr" 2>/dev/null
+        openssl x509 -req -in "${CERT_DIR}/panel-client.csr" -CA "${CA_CRT}" -CAkey "${CA_KEY}" -CAcreateserial \
+            -out "${PANEL_CRT}" -days 825 -sha256 2>/dev/null
+    fi
+    
+    chmod 600 "${CERT_DIR}"/*.key
+    chmod 644 "${CERT_DIR}"/*.crt
+}
+
+function deploy_app() {
+    echo -e "${YELLOW}[*] 部署 Python 后端代码...${PLAIN}"
+    mkdir -p "${AGENT_DIR}" "${DATA_DIR}" "${LOG_DIR}"
+    
+    # 生成 Key
+    KEY_FILE="${DATA_DIR}/agent.key"
+    if [[ ! -f "${KEY_FILE}" ]]; then
+        openssl rand -hex 32 > "${KEY_FILE}"
+    fi
+
+    # 写入 requirements.txt
+    cat > "${AGENT_DIR}/requirements.txt" <<EOF
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+EOF
+
+    # 写入 app.py (核心业务逻辑)
+    cat > "${AGENT_DIR}/app.py" <<'PYTHON_EOF'
+import os, json, time, subprocess
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Request, Depends
+from pydantic import BaseModel
+
+APP_NAME = "LXD-Agent"
+AGENT_KEY_PATH = os.environ.get("LXD_AGENT_KEY_PATH", "/opt/lxd-agent/data/agent.key")
+
+def load_key() -> str:
+    try:
+        with open(AGENT_KEY_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+def sh(cmd: List[str], timeout: int = 120) -> str:
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=timeout)
+        return out.decode("utf-8", "ignore")
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=e.output.decode("utf-8", "ignore"))
+
+def auth(req: Request):
+    key = req.headers.get("X-Panel-Key", "")
+    if not key or key != load_key():
+        raise HTTPException(status_code=401, detail="Bad key")
+    return True
+
+class CreateContainerReq(BaseModel):
+    name: str
+    image: str
+    cpu: int = 1
+    memory_mb: int = 512
+    disk_gb: int = 8
+    ingress_mbit: Optional[int] = None
+    egress_mbit: Optional[int] = None
+    autostart: bool = True
+
+class ExecReq(BaseModel):
+    cmd: List[str]
+
+app = FastAPI(title=APP_NAME)
+
+@app.get("/agent/health")
+def health():
+    return {"ok": True, "app": APP_NAME, "ts": int(time.time())}
+
+@app.get("/agent/containers")
+def list_containers(_=Depends(auth)):
+    raw = sh(["lxc", "list", "--format", "json"], timeout=60)
+    data = json.loads(raw or "[]")
+    # 简化返回
+    out = []
+    for it in data:
+        ipv4 = next((a.get("address") for n in (it.get("state", {}).get("network", {}) or {}).values() for a in (n.get("addresses") or []) if a.get("family") == "inet"), None)
+        out.append({"name": it.get("name"), "status": (it.get("status") or "").lower(), "ipv4": ipv4})
+    return {"items": out}
+
+@app.post("/agent/containers")
+def create_container(body: CreateContainerReq, _=Depends(auth)):
+    sh(["lxc", "launch" if body.autostart else "init", body.image, body.name], timeout=600)
+    sh(["lxc", "config", "set", body.name, "limits.cpu", str(body.cpu)])
+    sh(["lxc", "config", "set", body.name, "limits.memory", f"{body.memory_mb}MB"])
+    sh(["lxc", "config", "device", "set", body.name, "root", "size", f"{body.disk_gb}GB"])
+    if body.ingress_mbit:
+        sh(["lxc", "config", "device", "set", body.name, "eth0", "limits.ingress", f"{body.ingress_mbit}Mbit"])
+    if body.egress_mbit:
+        sh(["lxc", "config", "device", "set", body.name, "eth0", "limits.egress", f"{body.egress_mbit}Mbit"])
+    return {"ok": True, "name": body.name}
+
+@app.post("/agent/containers/{name}/start")
+def start(name: str, _=Depends(auth)):
+    sh(["lxc", "start", name])
+    return {"ok": True}
+
+@app.post("/agent/containers/{name}/stop")
+def stop(name: str, _=Depends(auth)):
+    sh(["lxc", "stop", name])
+    return {"ok": True}
+
+@app.delete("/agent/containers/{name}")
+def delete(name: str, _=Depends(auth)):
+    sh(["lxc", "delete", name, "--force"])
+    return {"ok": True}
+PYTHON_EOF
+
+    # 安装 Python 虚拟环境
+    if [[ ! -d "${PY_VENV}" ]]; then
+        python3 -m venv "${PY_VENV}"
+        "${PY_VENV}/bin/pip" install --upgrade pip >/dev/null
+        "${PY_VENV}/bin/pip" install -r "${AGENT_DIR}/requirements.txt" >/dev/null
+    fi
+}
+
+function configure_services() {
+    # 1. Systemd
+    cat > /etc/systemd/system/lxd-agent.service <<EOF
+[Unit]
+Description=LXD Agent API
+After=network.target snap.lxd.daemon.service
+[Service]
+Type=simple
+WorkingDirectory=${AGENT_DIR}
+Environment="LXD_AGENT_KEY_PATH=${DATA_DIR}/agent.key"
+ExecStart=${PY_VENV}/bin/uvicorn app:app --host 127.0.0.1 --port ${UVICORN_PORT}
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now lxd-agent.service
+
+    # 2. Nginx
+    # 读取用户输入的 Panel IP
+    read -p "请输入允许访问的控制面板IP (留空则允许所有IP): " PANEL_IP_INPUT
+    
+    ALLOW_RULE=""
+    if [[ -n "${PANEL_IP_INPUT}" ]]; then
+        ALLOW_RULE="allow ${PANEL_IP_INPUT}; deny all;"
+        echo -e "${GREEN}已配置仅允许 ${PANEL_IP_INPUT} 访问。${PLAIN}"
+    else
+        echo -e "${YELLOW}未限制 IP，将依赖 mTLS 证书保护。${PLAIN}"
+    fi
+
+    cat > /etc/nginx/sites-available/lxd-agent <<EOF
+server {
+    listen ${NGINX_HTTPS_PORT} ssl;
+    server_name _;
+    ssl_certificate      ${CERT_DIR}/server.crt;
+    ssl_certificate_key ${CERT_DIR}/server.key;
+    ssl_client_certificate ${CERT_DIR}/ca.crt;
+    ssl_verify_client on;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    
+    location /agent/ {
+        ${ALLOW_RULE}
+        proxy_pass http://127.0.0.1:${UVICORN_PORT}/agent/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+EOF
+    ln -sf /etc/nginx/sites-available/lxd-agent /etc/nginx/sites-enabled/lxd-agent
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+    nginx -t >/dev/null 2>&1
+    systemctl restart nginx
+    
+    # 3. Firewall
+    ufw allow 22/tcp >/dev/null 2>&1
+    ufw allow ${NGINX_HTTPS_PORT}/tcp >/dev/null 2>&1
+    echo "y" | ufw enable >/dev/null 2>&1
+}
+
+function show_token() {
+    HOST_IP="$(hostname -I | awk '{print $1}')"
+    BASE_URL="https://${HOST_IP}:${NGINX_HTTPS_PORT}"
+    CA_CONTENT="$(cat "${CERT_DIR}/ca.crt")"
+    CLIENT_CRT="$(cat "${CERT_DIR}/panel-client.crt")"
+    CLIENT_KEY="$(cat "${CERT_DIR}/panel-client.key")"
+    AGENT_KEY="$(cat "${DATA_DIR}/agent.key")"
+    
+    # 构造 JSON
+    JSON_STR=$(jq -nc \
+        --arg name "$(hostname)" \
+        --arg base_url "${BASE_URL}" \
+        --arg panel_key "${AGENT_KEY}" \
+        --arg ca "${CA_CONTENT}" \
+        --arg client_crt "${CLIENT_CRT}" \
+        --arg client_key "${CLIENT_KEY}" \
+        '{name:$name,base_url:$base_url,panel_key:$panel_key,ca_pem:$ca,client_cert_pem:$client_crt,client_key_pem:$client_key}')
+    
+    # Base64 编码
+    B64_TOKEN=$(echo -n "$JSON_STR" | base64 -w0)
+    
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${GREEN}节点连接信息 (Node Bundle)${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "请复制下方 Base64 字符串，粘贴到您的控制面板中："
+    echo ""
+    echo -e "${YELLOW}${B64_TOKEN}${PLAIN}"
+    echo ""
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+function install_all() {
+    install_dependencies
+    check_lxd
+    generate_certs
+    deploy_app
+    configure_services
+    echo -e "${GREEN}安装完成！${PLAIN}"
+    show_token
+}
+
+function uninstall_all() {
+    read -p "确定要卸载吗？(y/n): " confirm
+    if [[ "$confirm" == "y" ]]; then
+        systemctl stop lxd-agent
+        systemctl disable lxd-agent
+        rm -f /etc/systemd/system/lxd-agent.service
+        rm -f /etc/nginx/sites-enabled/lxd-agent
+        systemctl restart nginx
+        rm -rf "${AGENT_DIR}"
+        echo -e "${GREEN}卸载完成 (LXD 和容器保留，仅删除了 Agent)。${PLAIN}"
+    fi
+}
+
+# --- 主菜单 ---
+
+while true; do
+    print_title
+    echo -e "  1. ${GREEN}安装 / 更新 Agent${PLAIN} (部署服务)"
+    echo -e "  2. ${YELLOW}查看连接令牌${PLAIN} (Base64 Token)"
+    echo -e "  3. ${CYAN}查看服务状态${PLAIN} (LXD & Agent)"
+    echo -e "  4. ${RED}卸载 Agent${PLAIN}"
+    echo -e "  0. 退出"
+    echo ""
+    read -p " 请输入选项 [0-4]: " choice
+
+    case "$choice" in
+        1)
+            install_all
+            read -p "按回车键返回菜单..."
+            ;;
+        2)
+            if [[ -f "${DATA_DIR}/agent.key" ]]; then
+                show_token
+            else
+                echo -e "${RED}错误：尚未安装 Agent，请先运行安装。${PLAIN}"
+            fi
+            read -p "按回车键返回菜单..."
+            ;;
+        3)
+            echo "--- LXD Agent 状态 ---"
+            systemctl status lxd-agent --no-pager
+            echo "--- Nginx 状态 ---"
+            systemctl status nginx --no-pager
+            read -p "按回车键返回菜单..."
+            ;;
+        4)
+            uninstall_all
+            read -p "按回车键返回菜单..."
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效输入${PLAIN}"
+            sleep 1
+            ;;
+    esac
+done
